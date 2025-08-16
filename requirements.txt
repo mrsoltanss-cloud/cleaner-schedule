@@ -4,7 +4,7 @@ uvicorn==0.30.5
 requests==2.32.3
 icalendar==5.0.12
 pytz==2024.1
-twilio==9.1.0
+twilio==9.2.3
 gspread==5.12.0
 google-auth==2.33.0
 reportlab==4.2.2
