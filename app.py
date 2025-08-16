@@ -27,13 +27,16 @@ PALETTE = [
     "#34495e",  # navy
 ]
 
-def load_flats(max_flats: int = 50):
+
+def load_flats(max_flats: int = 50) -> Dict[str, Dict[str, str]]:
     """
-    Read FLAT{n}_ICS_URL (+ optional NAME/NICK/COLOUR) from env.
-    Returns: dict[name] = { url, nick, color }
-    """
-    flats = {}
-    palette_i = 0
+    Collect flats from environment variables.
+
+    Supports BOTH styles:
+      - New: FLAT1_ICS_URL, FLAT1_NAME, FLAT1_NICK, FLAT1_COLOUR, ...
+      - Legacy: FLAT7_ICS_URL, FLAT8_ICS_URL, FLAT9_ICS_URL, ...
+
+    Returns dict k
     for n in range(1, max_flats + 1):
         url = os.getenv(f"FLAT{n}_ICS_URL", "").strip()
         if not url:
