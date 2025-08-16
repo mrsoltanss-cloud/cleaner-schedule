@@ -17,19 +17,14 @@ def health():
 
 @app.get("/", response_class=PlainTextResponse)
 def home(days: int = Query(int(os.getenv("DEFAULT_DAYS", "14")), ge=1, le=60)):
-    # Read calendar URLs from environment variables
     flats = {
         os.getenv("FLAT7_NAME", "Flat 7"): os.getenv("FLAT7_ICS_URL", ""),
         os.getenv("FLAT8_NAME", "Flat 8"): os.getenv("FLAT8_ICS_URL", ""),
         os.getenv("FLAT9_NAME", "Flat 9"): os.getenv("FLAT9_ICS_URL", ""),
     }
 
-    # Fetch and parse calendars
     ics_map = {name: fetch_ics(url) for name, url in flats.items() if url}
     bookings = parse_bookings(ics_map)
-
-    # Build next N days and format for cleaners
     schedule = build_schedule_for_days(bookings, start=date.today(), days=days)
     text = format_schedule(schedule)
-
     return text or "No check-ins or check-outs in the selected window."
