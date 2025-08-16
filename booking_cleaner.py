@@ -1,63 +1,94 @@
-
-import os
-from datetime import datetime, timedelta, date
+from datetime import date, timedelta
 from typing import Dict, List, Tuple
 import requests
-from zoneinfo import ZoneInfo
 from icalendar import Calendar
 
+# 1) Download raw ICS text
 def fetch_ics(url: str) -> str:
     if not url:
         return ""
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
 
-def parse_bookings(ics_map: Dict[str, str], timezone: ZoneInfo) -> Dict[str, List[Tuple[date, date]]]:
+# 2) Parse bookings per flat -> list of (start_date, end_date)
+def parse_bookings(ics_map: Dict[str, str]) -> Dict[str, List[Tuple[date, date]]]:
     results: Dict[str, List[Tuple[date, date]]] = {}
     for flat_name, ics_text in ics_map.items():
-        c = Calendar.from_ical(ics_text)
         events: List[Tuple[date, date]] = []
-        for component in c.walk():
-            if component.name != "VEVENT":
+        if not ics_text:
+            results[flat_name] = events
+            continue
+
+        cal = Calendar.from_ical(ics_text)
+        for comp in cal.walk():
+            if comp.name != "VEVENT":
                 continue
-            dtstart = component.get("dtstart").dt
-            dtend = component.get("dtend").dt
-            if hasattr(dtstart, "astimezone"):
-                dtstart = dtstart.astimezone(timezone).date()
-            if hasattr(dtend, "astimezone"):
-                dtend = dtend.astimezone(timezone).date()
+
+            dtstart = comp.get("dtstart")
+            dtend = comp.get("dtend")
+            if not dtstart or not dtend:
+                continue
+
+            dtstart = dtstart.dt
+            dtend = dtend.dt
+
+            # Normalize to date objects
+            if hasattr(dtstart, "date"):
+                dtstart = dtstart.date()
+            if hasattr(dtend, "date"):
+                dtend = dtend.date()
+
+            # Skip bad ranges
+            if not isinstance(dtstart, date) or not isinstance(dtend, date):
+                continue
             if dtend <= dtstart:
                 continue
+
             events.append((dtstart, dtend))
+
         events.sort(key=lambda x: (x[0], x[1]))
         results[flat_name] = events
     return results
 
-def build_schedule_for_days(bookings: Dict[str, List[Tuple[date, date]]], start_date: date, days: int = 14) -> Dict[date, Dict[str, Dict[str, bool]]]:
+# 3) Build "what happens on each day" for N days ahead
+def build_schedule_for_days(
+    bookings: Dict[str, List[Tuple[date, date]]],
+    start: date,
+    days: int = 14
+) -> Dict[date, Dict[str, Dict[str, bool]]]:
     schedule: Dict[date, Dict[str, Dict[str, bool]]] = {}
     for i in range(days):
-        d = start_date + timedelta(days=i)
+        d = start + timedelta(days=i)
         day_map: Dict[str, Dict[str, bool]] = {}
-        for flat_name, events in bookings.items():
-            ci = any(evt[0] == d for evt in events)
-            co = any(evt[1] == d for evt in events)
-            if ci or co:
-                day_map[flat_name] = {"check_in": ci, "check_out": co}
+        for flat, events in bookings.items():
+            check_in = any(s == d for s, e in events)
+            check_out = any(e == d for s, e in events)
+            if check_in or check_out:
+                day_map[flat] = {"check_in": check_in, "check_out": check_out}
         if day_map:
             schedule[d] = day_map
     return schedule
 
-def format_schedule_whatsapp(schedule: Dict[date, Dict[str, Dict[str, bool]]]) -> str:
+# 4) Turn the schedule into simple cleaner-friendly text
+def format_schedule(schedule: Dict[date, Dict[str, Dict[str, bool]]]) -> str:
     if not schedule:
         return "No check-ins or check-outs in the selected window."
     lines: List[str] = []
     for d in sorted(schedule.keys()):
-        items: List[str] = []
-        for flat_name, flags in sorted(schedule[d].items()):
+        parts: List[str] = []
+        for flat, flags in sorted(schedule[d].items()):
             ci = flags.get("check_in", False)
             co = flags.get("check_out", False)
             if ci and co:
+                parts.append(f"{flat}: out/clean/in")
+            elif co:
+                parts.append(f"{flat}: out/clean")
+            elif ci:
+                parts.append(f"{flat}: check-in")
+        if parts:
+            lines.append(f"{d.strftime('%a %d %b')} — " + "; ".join(parts))
+    return "\n".join(lines)
                 items.append(f"{flat_name}: out/clean/in")
             elif co:
                 items.append(f"{flat_name}: out/clean")
