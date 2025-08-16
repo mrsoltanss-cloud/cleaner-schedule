@@ -340,7 +340,7 @@ def debug(days: int = Query(30, ge=1, le=120)):
     for flat, ranges in bookings.items():
         lines.append(f"{flat}: " + ("; ".join([f"{s} → {e}" for s, e in ranges]) if ranges else "(none)"))
     return "\n".join(lines)
-      - Legacy: FLAT7_ICS_URL, FLAT8_ICS_URL, FLAT9_ICS_URL, ...
+      # Legacy: FLAT7_ICS_URL, FLAT8_ICS_URL, FLAT9_ICS_URL, ...
 
     Returns dict k
     for n in range(1, max_flats + 1):
