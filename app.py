@@ -1,361 +1,454 @@
 import os
 import io
 import uuid
-import re
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple
 
-import pytz
 import requests
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
-from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse, RedirectResponse
+from fastapi import FastAPI, Request, UploadFile, Form
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from icalendar import Calendar
-from twilio.rest import Client
-from urllib.parse import urlencode
+from pytz import timezone, UTC
 
-# ----------------------------
-# Config / Environment
-# ----------------------------
+# ====== App & static uploads ======
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-TIMEZONE = os.getenv("TIMEZONE", "Europe/London")
-TZ = pytz.timezone(TIMEZONE)
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Serve uploaded files at /uploads/<filename>
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+# ====== Config / helpers ======
+PALETTE = ["#FF9800", "#2196F3", "#4CAF50", "#9C27B0", "#F44336", "#009688"]
+CLEAN_START = os.getenv("CLEAN_START", "10:00")
+CLEAN_END = os.getenv("CLEAN_END", "16:00")
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "14"))
+TZ_NAME = os.getenv("TIMEZONE", "Europe/London")
+TZ = timezone(TZ_NAME)
 
-PALETTE = ["#FF9800", "#2196F3", "#4CAF50", "#9C27B0", "#E91E63", "#00BCD4", "#795548"]
-
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
-TWILIO_WHATSAPP_TO = os.getenv("TWILIO_WHATSAPP_TO", "").strip()
-
-def _wa(num: str) -> str:
-    if not num:
-        return ""
-    return num if num.startswith("whatsapp:") else f"whatsapp:{num}"
-
-WA_FROM = _wa(TWILIO_WHATSAPP_FROM)
-WA_TO = _wa(TWILIO_WHATSAPP_TO)
-
-twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    try:
-        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    except Exception:
-        twilio_client = None
-
-# ----------------------------
-# Flats from env: FLAT7_*, FLAT8_*, FLAT9_* ...
-# ----------------------------
-
-def load_flats_from_env(max_flats: int = 99) -> Dict[str, Dict[str, str]]:
+def load_flats() -> Dict[str, Dict[str, str]]:
+    """
+    Returns dict keyed by display name, e.g.
+      {
+        "Flat 7": {"url": "https://...ics", "nick": "Orange", "colour": "#FF9800"},
+        ...
+      }
+    Supports:
+      - Your current envs: FLAT7_ICS_URL / FLAT8_ICS_URL / FLAT9_ICS_URL
+      - Generic pattern:   FLAT{n}_ICS_URL for n in 1..50
+      - Optional branding: FLAT{n}_NAME, FLAT{n}_NICK, FLAT{n}_COLOUR
+    Skips placeholder values like "SET"/"TODO".
+    """
     flats: Dict[str, Dict[str, str]] = {}
-    i = 0
-    for n in range(1, max_flats + 1):
-        url = os.getenv(f"FLAT{n}_ICS_URL", "").strip()
-        if not url:
-            continue
+    palette_i = 0
+
+    def add_flat(n: int, url_key: str):
+        nonlocal palette_i
+        url = os.getenv(url_key, "")
+        if not url or url.strip().upper() in {"SET", "TODO"}:
+            return
+
         name = os.getenv(f"FLAT{n}_NAME", f"Flat {n}").strip()
         nick = os.getenv(f"FLAT{n}_NICK", name).strip()
-        colour = os.getenv(f"FLAT{n}_COLOUR", PALETTE[i % len(PALETTE)]).strip()
-        i += 1
-        flats[name] = {"url": url, "nick": nick, "colour": colour}
+        colour = os.getenv(
+            f"FLAT{n}_COLOUR",
+            PALETTE[palette_i % len(PALETTE)],
+        ).strip()
+
+        flats[name] = {"url": url.strip(), "nick": nick, "colour": colour}
+        palette_i += 1
+
+    # Read explicit legacy 7/8/9 first
+    for n in (7, 8, 9):
+        add_flat(n, f"FLAT{n}_ICS_URL")
+
+    # Also support generic FLAT1..FLAT50
+    for n in range(1, 51):
+        url = os.getenv(f"FLAT{n}_ICS_URL", "")
+        if not url or url.strip().upper() in {"SET", "TODO"}:
+            continue
+        # Avoid duplicate key if already added via legacy
+        name_probe = os.getenv(f"FLAT{n}_NAME", f"Flat {n}").strip()
+        if name_probe in flats:
+            continue
+        add_flat(n, f"FLAT{n}_ICS_URL")
+
     return flats
-
-FLATS = load_flats_from_env()
-
-# ----------------------------
-# ICS helpers
-# ----------------------------
-
-UA_HEADERS = {"User-Agent": "CleanerSchedule/1.0 (+https://example.com)"}
 
 def fetch_ics(url: str) -> str:
     if not url:
         return ""
-    r = requests.get(url, timeout=30, headers=UA_HEADERS)
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.text
 
-# very tolerant matchers: check-in/out with hyphen, en dash, em dash or space, any case
-RE_IN = re.compile(r"check[\s\-–—]?in", re.IGNORECASE)
-RE_OUT = re.compile(r"check[\s\-–—]?out", re.IGNORECASE)
-
-def _event_status(summary: str, description: str) -> str:
-    """Return 'in'/'out'/'' based on summary/description."""
-    text = f"{summary}\n{description}".lower()
-    if RE_OUT.search(text):
-        return "out"
-    if RE_IN.search(text):
-        return "in"
-    return ""
-
-def parse_bookings(ics_map: Dict[str, str]) -> Dict[str, List[Tuple[date, str]]]:
+def parse_ics_to_ranges(ics_str: str) -> List[Tuple[date, date]]:
     """
-    Returns { flat: [(date, 'in'|'out'), ...] }.
-    Accepts matches in SUMMARY or DESCRIPTION; tolerant to punctuation/case.
+    Parse ICS into a list of (checkin_date, checkout_date) in local TZ (date only).
+    Assumes VEVENT DTSTART is check-in and DTEND is check-out (Booking.com style).
     """
-    out: Dict[str, List[Tuple[date, str]]] = {}
-    for flat_name, ics_text in ics_map.items():
-        items: List[Tuple[date, str]] = []
-        if not ics_text:
-            out[flat_name] = items
-            continue
-        try:
-            cal = Calendar.from_ical(ics_text)
-        except Exception:
-            out[flat_name] = items
+    if not ics_str:
+        return []
+
+    cal = Calendar.from_ical(ics_str)
+    ranges: List[Tuple[date, date]] = []
+
+    for component in cal.walk():
+        if component.name != "VEVENT":
             continue
 
-        for comp in cal.walk():
-            if comp.name != "VEVENT":
-                continue
-            summary = str(comp.get("SUMMARY", "") or "")
-            description = str(comp.get("DESCRIPTION", "") or "")
-            dtstart_prop = comp.get("DTSTART")
-            if not dtstart_prop:
-                continue
+        dtstart = component.get("DTSTART")
+        dtend = component.get("DTEND")
 
-            dtstart = dtstart_prop.dt
-            if isinstance(dtstart, datetime):
-                if dtstart.tzinfo is None:
-                    dtstart = TZ.localize(dtstart)
-                else:
-                    dtstart = dtstart.astimezone(TZ)
-                d = dtstart.date()
-            elif isinstance(dtstart, date):
-                d = dtstart
-            else:
-                continue
+        if not dtstart or not dtend:
+            continue
 
-            status = _event_status(summary, description)
-            if status in ("in", "out"):
-                items.append((d, status))
+        # Normalize to timezone-aware datetime
+        def to_dt(x):
+            val = x.dt
+            if isinstance(val, datetime):
+                return val if val.tzinfo else TZ.localize(val)
+            # If it's a date, treat as midnight local time
+            return TZ.localize(datetime.combine(val, datetime.min.time()))
 
-        items.sort(key=lambda x: (x[0], x[1]))
-        out[flat_name] = items
-    return out
+        start_dt = to_dt(dtstart)
+        end_dt = to_dt(dtend)
 
-def build_schedule_for_days(days: int) -> Dict[date, List[Dict[str, str]]]:
-    if not FLATS:
-        return {}
+        # Convert to our local timezone
+        start_local = start_dt.astimezone(TZ)
+        end_local = end_dt.astimezone(TZ)
 
-    ics_map: Dict[str, str] = {}
-    for flat, meta in FLATS.items():
-        try:
-            ics_map[flat] = fetch_ics(meta["url"])
-        except Exception:
-            ics_map[flat] = ""
+        # Represent as dates (checkin date, checkout date)
+        ranges.append((start_local.date(), end_local.date()))
 
-    bookings = parse_bookings(ics_map)
+    return ranges
 
+def build_schedule(flats: Dict[str, Dict[str, str]], days: int) -> Dict[date, List[Dict]]:
+    """
+    Returns: { day_date: [ {flat, nick, colour, in?:bool, out?:bool}, ... ] }
+    We derive per-day check-in/out from each reservation range (start,end).
+    """
     today = datetime.now(TZ).date()
-    end_day = today + timedelta(days=days - 1)
+    end_day = today + timedelta(days=days)
 
-    per_flat_per_day: Dict[str, Dict[date, List[str]]] = {}
-    for flat, events in bookings.items():
-        dmap: Dict[date, List[str]] = {}
-        for d, status in events:
-            if today <= d <= end_day:
-                dmap.setdefault(d, []).append(status)
-        per_flat_per_day[flat] = dmap
+    schedule: Dict[date, List[Dict]] = {}
 
-    schedule: Dict[date, List[Dict[str, str]]] = {}
-    d = today
-    while d <= end_day:
-        items: List[Dict[str, str]] = []
-        for flat, dmap in per_flat_per_day.items():
-            statuses = dmap.get(d, [])
-            if not statuses:
-                continue
-            has_out = "out" in statuses
-            has_in = "in" in statuses
-            same = "yes" if (has_out and has_in) else "no"
+    # Prepare ICS for each flat
+    for flat_name, meta in flats.items():
+        try:
+            ics = fetch_ics(meta["url"])
+            ranges = parse_ics_to_ranges(ics)
+        except Exception:
+            ranges = []
 
-            if has_out:
-                items.append({"flat": flat, "nick": FLATS[flat]["nick"], "status": "out", "same_day": same})
-            if has_in:
-                items.append({"flat": flat, "nick": FLATS[flat]["nick"], "status": "in", "same_day": same})
+        # For each reservation, mark check-in and check-out days
+        for (dstart, dend) in ranges:
+            # Check-in
+            if today <= dstart < end_day:
+                schedule.setdefault(dstart, [])
+                schedule[dstart].append(
+                    {"flat": flat_name, "nick": meta["nick"], "colour": meta["colour"], "in": True, "out": False}
+                )
+            # Check-out
+            if today <= dend < end_day:
+                schedule.setdefault(dend, [])
+                schedule[dend].append(
+                    {"flat": flat_name, "nick": meta["nick"], "colour": meta["colour"], "in": False, "out": True}
+                )
 
-        if items:
-            schedule[d] = items
-        d += timedelta(days=1)
+    # Merge flat entries per day: if a flat has both in & out on same day -> same-day turnaround
+    for d, items in list(schedule.items()):
+        merged: Dict[str, Dict] = {}
+        for it in items:
+            key = it["flat"]
+            if key not in merged:
+                merged[key] = {**it}
+            else:
+                merged[key]["in"] = merged[key].get("in", False) or it.get("in", False)
+                merged[key]["out"] = merged[key].get("out", False) or it.get("out", False)
+        schedule[d] = list(merged.values())
+
+    # Sort days & within day by flat name
+    schedule = dict(sorted(schedule.items(), key=lambda kv: kv[0]))
+    for d in schedule:
+        schedule[d].sort(key=lambda x: x["flat"])
 
     return schedule
 
-# ----------------------------
-# Web
-# ----------------------------
+# ====== HTML rendering ======
+def html_header() -> str:
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cleaner Schedule</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 24px; color:#111; }}
+    .wrap {{ max-width: 980px; margin: 0 auto; }}
+    .subtle {{ color:#666; }}
+    .legend span {{ margin-right: 12px; }}
+    .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; color:#fff; }}
+    .today {{ background:#111; color:#fff; font-size:12px; padding:3px 8px; border-radius:999px; margin-left:8px; vertical-align:middle; }}
+    .day {{ background:#fafafa; border:1px solid #eee; border-radius:14px; padding:18px 20px; margin:16px 0; }}
+    .row {{ display:flex; align-items:center; gap:12px; padding:8px 0; }}
+    .nick {{ font-weight:700; padding:3px 10px; border-radius:999px; color:#fff; }}
+    .status-out {{ color:#d32f2f; font-weight:700; }}
+    .status-in {{ color:#2e7d32; font-weight:700; }}
+    .note {{ font-size:13px; color:#444; }}
+    .btn {{ background:#1976d2; color:#fff; padding:8px 12px; border-radius:8px; text-decoration:none; display:inline-flex; align-items:center; gap:8px; font-weight:600; }}
+    .btn:hover {{ background:#125ea8; }}
+    .muted {{ color:#888; }}
+    .same {{ background:#fff3cd; border:1px solid #ffe08a; color:#5c3c00; padding:2px 8px; border-radius:6px; font-weight:600; }}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Cleaner Schedule</h1>
+  <div class="subtle legend">
+    <span>Check-out in <span style="color:#d32f2f;font-weight:700;">red</span></span> •
+    <span>Check-in in <span style="color:#2e7d32;font-weight:700;">green</span></span> •
+    <span>Same-day turnover highlighted</span> •
+    <span>Clean {CLEAN_START}–{CLEAN_END}</span>
+  </div>
+"""
+def html_footer() -> str:
+    return "</div></body></html>"
 
-app = FastAPI()
+def render_cleaner(schedule: Dict[date, List[Dict]], days: int) -> str:
+    today = datetime.now(TZ).date()
+    out = [html_header()]
 
+    if not schedule:
+        out.append(f"""
+        <p class="muted">No activity found. Try a longer window: <a href="/cleaner?days=30">/cleaner?days=30</a> or see <a href="/debug">/debug</a>.</p>
+        """)
+        out.append(html_footer())
+        return "\n".join(out)
+
+    for d, items in schedule.items():
+        day_title = d.strftime("%a %d %b")
+        is_today = (d == today)
+        out.append(f'<div class="day"><h2 style="margin:0 0 8px 0;">{day_title}{" <span class=\\"today\\">TODAY</span>" if is_today else ""}</h2>')
+
+        # detect if any check-out exists for this day (to show clean window)
+        any_checkout = any(it.get("out") for it in items)
+
+        # rows
+        for it in items:
+            colour = it["colour"]
+            nick = it["nick"]
+            flat = it["flat"]
+            is_out = it.get("out", False)
+            is_in = it.get("in", False)
+            same_day = is_out and is_in
+
+            status_parts = []
+            if same_day:
+                status_html = '<span class="same">Check-out → Clean → Check-in (same day)</span>'
+            else:
+                if is_out:
+                    status_parts.append('<span class="status-out">Check-out</span>')
+                if is_in:
+                    status_parts.append('<span class="status-in">Check-in</span>')
+                status_html = " • ".join(status_parts) if status_parts else ""
+
+            # Clean window shown if there is a checkout that day, or same-day
+            show_clean_band = same_day or (is_out and not is_in) or (any_checkout and not is_in)
+
+            # Upload link
+            up_href = f'/upload?flat={flat.replace(" ", "%20")}&date={d.isoformat()}'
+
+            out.append('<div class="row">')
+            out.append(f'<span class="nick" style="background:{colour}">{nick}</span>')
+            out.append(status_html)
+            if show_clean_band:
+                out.append(f'<span class="note">🧹 Clean between <strong>{CLEAN_START}–{CLEAN_END}</strong></span>')
+            out.append(f'<a class="btn" href="{up_href}">📷 Upload Photos</a>')
+            out.append('</div>')
+
+        out.append('</div>')
+
+    out.append(html_footer())
+    return "\n".join(out)
+
+# ====== Routes ======
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return "OK"
 
-def today_badge(d: date) -> str:
-    return '<span class="badge today">TODAY</span>' if d == datetime.now(TZ).date() else ""
-
 @app.get("/cleaner", response_class=HTMLResponse)
-def cleaner_view(days: int = DEFAULT_DAYS):
-    sched = build_schedule_for_days(days)
-    if not sched:
-        longer = f"/cleaner?{urlencode({'days': max(30, days)})}"
-        return f"""
-        <html><head><title>Cleaner Schedule</title>
-        <style>
-          body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 24px; color:#222 }}
-          .badge.today {{ background:#111; color:#fff; padding:4px 8px; border-radius:999px; font-size:12px }}
-        </style></head><body>
-          <h1>Cleaner Schedule</h1>
-          <div>Check-out in <span style="color:#c62828">red</span> • Check-in in <span style="color:#2e7d32">green</span> • Same-day turnover highlighted • Clean 10:00–16:00</div>
-          <p>No activity found. Try a longer window: <a href="{longer}">{longer}</a> or see <a href="/debug">/debug</a>.</p>
-        </body></html>
-        """
-
-    html = ["""
-    <html><head><title>Cleaner Schedule</title>
-    <style>
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding:24px; color:#222; background:#f7f7f8 }
-      .day { background:#fff; border:1px solid #eee; border-radius:12px; padding:16px 18px; margin:18px 0; box-shadow:0 2px 6px rgba(0,0,0,.04)}
-      h1 { margin:0 0 10px }
-      h2 { margin:0 0 12px; display:flex; align-items:center; gap:10px }
-      .badge.today { background:#111; color:#fff; padding:4px 8px; border-radius:999px; font-size:12px }
-      .chip { display:inline-block; padding:4px 10px; border-radius:999px; color:#fff; font-weight:600; margin-right:10px }
-      .status-out { color:#c62828; font-weight:700 }
-      .status-in { color:#2e7d32; font-weight:700 }
-      .turn { display:inline-block; background:#FFF3CD; border:1px solid #FFE28A; color:#6b5b00; padding:2px 8px; border-radius:6px; font-size:12px; margin-left:8px }
-      .note { color:#666; font-size:14px; margin:8px 0 }
-      .btn { display:inline-block; background:#1976d2; color:#fff; text-decoration:none; padding:8px 12px; border-radius:8px; font-size:14px; border:0; cursor:pointer }
-      form.upload { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center }
-      input[type=file] { padding:6px }
-      textarea { width:320px; height:70px; padding:8px; border-radius:8px; border:1px solid #ddd; font-family:inherit }
-      .row { margin:10px 0 }
-    </style></head><body>
-      <h1>Cleaner Schedule</h1>
-      <div>Check-out in <span style="color:#c62828">red</span> • Check-in in <span style="color:#2e7d32">green</span> • Same-day turnover highlighted • Clean 10:00–16:00</div>
-    """]
-    for d, items in sched.items():
-        html.append(f'<div class="day"><h2>{d.strftime("%a %d %b")} {today_badge(d)}</h2>')
-        for it in items:
-            flat = it["flat"]
-            nick = it["nick"]
-            colour = FLATS[flat]["colour"] or "#555"
-            status_text = "Check-out" if it["status"] == "out" else "Check-in"
-            status_class = "status-out" if it["status"] == "out" else "status-in"
-            same = ''
-            if it["same_day"] == "yes":
-                same = '<span class="turn">Check-out → <b>Clean</b> → Check-in (same-day)</span>'
-            chip = f'<span class="chip" style="background:{colour}">{nick}</span>'
-            html.append(f'<div class="row">{chip} <span class="{status_class}">{status_text}</span>{same}</div>')
-            if it["status"] == "out":
-                html.append('<div class="note">🧹 Clean between <b>10:00–16:00</b></div>')
-            html.append(f"""
-            <form class="upload" action="/upload" method="post" enctype="multipart/form-data">
-              <input type="hidden" name="flat" value="{flat}">
-              <input type="hidden" name="date" value="{d.isoformat()}">
-              <input type="file" name="photo" accept="image/*" required>
-              <textarea name="notes" placeholder="Any notes for today? (optional)"></textarea>
-              <button class="btn" type="submit">📸 Upload Photos</button>
-            </form>""")
-        html.append("</div>")
-    html.append("</body></html>")
-    return "\n".join(html)
-
-# ----------------------------
-# Media for Twilio
-# ----------------------------
-
-UPLOAD_DIR = "/tmp/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-@app.get("/m/{fname}")
-def serve_media(fname: str):
-    path = os.path.join(UPLOAD_DIR, fname)
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="Not found")
-    media_type = "image/jpeg"
-    fl = fname.lower()
-    if fl.endswith(".png"):
-        media_type = "image/png"
-    elif fl.endswith(".webp"):
-        media_type = "image/webp"
-    return FileResponse(path, media_type=media_type)
-
-# ----------------------------
-# Upload + WhatsApp
-# ----------------------------
-
-@app.post("/upload")
-async def upload_photo(
-    flat: str = Form(...),
-    date: str = Form(""),
-    notes: str = Form(""),
-    photo: UploadFile = File(...)
-):
-    # Save file
-    ext = ".jpg"
-    ct = (photo.content_type or "").lower()
-    if "png" in ct:
-        ext = ".png"
-    elif "webp" in ct:
-        ext = ".webp"
-    fname = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(UPLOAD_DIR, fname)
-    content = await photo.read()
-    with open(dest, "wb") as f:
-        f.write(content)
-
-    base = os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
-    media_url = f"{base}/m/{fname}" if base else f"/m/{fname}"
-
-    pretty = date or datetime.now(TZ).date().isoformat()
-    nick = FLATS.get(flat, {}).get("nick", flat)
-    body = f"Cleaning complete: {nick}\nDate: {pretty}\nNotes: {(notes.strip() or 'No notes.')}"
-
-    if twilio_client and WA_FROM and WA_TO:
-        try:
-            kwargs = dict(from_=WA_FROM, to=WA_TO, body=body)
-            if media_url.startswith("http"):
-                kwargs["media_url"] = [media_url]
-            twilio_client.messages.create(**kwargs)
-        except Exception:
-            # still return success to the cleaner
-            pass
-
-    return RedirectResponse(f"/cleaner?{urlencode({'days': DEFAULT_DAYS})}", status_code=303)
-
-# ----------------------------
-# Debug
-# ----------------------------
+def cleaner(days: int = DEFAULT_DAYS):
+    flats = load_flats()
+    schedule = build_schedule(flats, days)
+    return HTMLResponse(render_cleaner(schedule, days))
 
 @app.get("/debug", response_class=PlainTextResponse)
 def debug():
-    lines = []
-    lines.append("Loaded flats:")
-    for flat, meta in FLATS.items():
-        lines.append(f"  {flat}: url={'SET' if meta['url'] else 'MISSING'} nick={meta['nick']} colour={meta['colour']}")
-    # Fetch & parse with counts
-    ics_map = {}
-    for flat, meta in FLATS.items():
-        try:
-            ics_map[flat] = fetch_ics(meta["url"])
-        except Exception as e:
-            ics_map[flat] = ""
-    bookings = parse_bookings(ics_map)
-    lines.append("")
-    for flat, items in bookings.items():
-        ins = sum(1 for d,s in items if s == 'in')
-        outs = sum(1 for d,s in items if s == 'out')
-        lines.append(f"{flat}: total={len(items)} (in={ins}, out={outs})")
-    sched = build_schedule_for_days(14)
-    lines.append(f"\nDays with activity in next 14 days: {len(sched)}")
-    return "\n".join(lines)
+    flats = load_flats()
+    lines = ["Loaded flats:"]
+    for name, meta in flats.items():
+        lines.append(f"  {name}: url={meta['url']} nick={meta['nick']} colour={meta['colour']}")
+    # quick probe counts
+    try_days = 14
+    sched = build_schedule(flats, try_days)
+    counts = {k: len(v) for k, v in sched.items()}
+    lines.append("\nCounts per day (next 14 days):")
+    for d in sorted(counts.keys()):
+        lines.append(f"  {d.isoformat()}: {counts[d]}")
+    lines.append(f"\nDays with activity in next {try_days} days: {len(sched)}")
+    return "\n".join(lines) + "\n"
 
-# ----------------------------
-# Run
-# ----------------------------
+# ====== Upload + WhatsApp ======
+TW_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TW_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TW_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
+TW_TO = os.getenv("TWILIO_WHATSAPP_TO", "").strip()
 
+def send_whatsapp(body: str, media_urls: List[str]):
+    """
+    Send WhatsApp message (text + media) using Twilio.
+    Requires approved WA sender (Business) and proper FROM/TO in E.164 without 'whatsapp:' prefix here;
+    we add the prefix below.
+    """
+    if not (TW_SID and TW_TOKEN and TW_FROM and TW_TO):
+        # Silently skip if not configured (avoids 500s while setting up)
+        return
+
+    try:
+        from twilio.rest import Client
+        client = Client(TW_SID, TW_TOKEN)
+        client.messages.create(
+            from_=f"whatsapp:{TW_FROM}",
+            to=f"whatsapp:{TW_TO}",
+            body=body,
+            media_url=media_urls if media_urls else None,
+        )
+    except Exception as e:
+        # Avoid crashing the request: log to console
+        print("Twilio send error:", repr(e))
+
+def html_upload_form(flat: str, the_date: str, error: str = "") -> str:
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Upload Photos</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 24px; color:#111; }}
+    .wrap {{ max-width: 720px; margin: 0 auto; }}
+    .box {{ background:#fafafa; border:1px solid #eee; border-radius:12px; padding:18px; }}
+    .row {{ margin:12px 0; }}
+    .btn {{ background:#1976d2; color:#fff; padding:10px 14px; border-radius:8px; text-decoration:none; font-weight:600; display:inline-block; border:0; }}
+    .btn:hover {{ background:#125ea8; }}
+    .err {{ color:#b00020; font-weight:700; }}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Upload Photos — {flat} — {the_date}</h2>
+  <p>Attach one or more photos and (optional) leave a note.</p>
+  {"<p class='err'>" + error + "</p>" if error else ""}
+  <div class="box">
+    <form method="post" enctype="multipart/form-data" action="/upload">
+      <input type="hidden" name="flat" value="{flat}">
+      <input type="hidden" name="date" value="{the_date}">
+      <div class="row">
+        <label>Photos (you can select multiple):</label><br/>
+        <input name="photos" type="file" accept="image/*" multiple required />
+      </div>
+      <div class="row">
+        <label>Optional note for host:</label><br/>
+        <textarea name="note" rows="4" style="width:100%;" placeholder="Any issues, damages, extra time needed, missing items, etc."></textarea>
+      </div>
+      <div class="row">
+        <button class="btn" type="submit">Send</button>
+        <a class="btn" style="background:#555;margin-left:8px;" href="/cleaner">Back</a>
+      </div>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+@app.get("/upload", response_class=HTMLResponse)
+def get_upload(flat: str, date: str):
+    # simple guard: require known flat
+    flats = load_flats()
+    if flat not in flats:
+        return HTMLResponse(html_upload_form(flat, date, error="Unknown flat (check the link)."))
+    return HTMLResponse(html_upload_form(flat, date))
+
+@app.post("/upload", response_class=HTMLResponse)
+async def post_upload(request: Request, flat: str = Form(...), date: str = Form(...), photos: List[UploadFile] = Form(...), note: str = Form("")):
+    # Save files and build public URLs
+    saved_urls: List[str] = []
+    for f in photos:
+        if not f.filename:
+            continue
+        ext = os.path.splitext(f.filename)[1].lower()
+        safe_name = f"{uuid.uuid4().hex}{ext}"
+        dst_path = os.path.join(UPLOAD_DIR, safe_name)
+        data = await f.read()
+        with open(dst_path, "wb") as out:
+            out.write(data)
+        # Public URL that Twilio can fetch
+        base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        if not base:
+            # Infer from request (works on Render)
+            base = str(request.url).split("/upload")[0]
+        saved_urls.append(f"{base}/uploads/{safe_name}")
+
+    # Compose WA body
+    body_lines = [
+        f"Cleaning complete: {flat}",
+        f"Date: {date}",
+    ]
+    if note and note.strip():
+        body_lines.append(f"Note: {note.strip()}")
+    body = "\n".join(body_lines)
+
+    # Send WhatsApp (if configured)
+    send_whatsapp(body, saved_urls)
+
+    # Simple thank you + back link
+    files_list = "".join([f'<li><a href="{u}" target="_blank">{u}</a></li>' for u in saved_urls]) or "<li>(no files?)</li>"
+    return HTMLResponse(f"""
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Uploaded</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:24px;color:#111;}}
+.wrap{{max-width:720px;margin:0 auto;}}
+.box{{background:#fafafa;border:1px solid #eee;border-radius:12px;padding:18px;}}
+.btn{{background:#1976d2;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;}}
+.btn:hover{{background:#125ea8;}}
+</style></head>
+<body>
+<div class="wrap">
+  <h2>Thanks! 📸</h2>
+  <div class="box">
+    <p>We received your photos for <strong>{flat}</strong> — <strong>{date}</strong>.</p>
+    {"<p>Links we saved:</p><ul>" + files_list + "</ul>"}
+    <p><a class="btn" href="/cleaner">Back to schedule</a></p>
+  </div>
+</div>
+</body></html>
+""")
+
+# ====== Run locally ======
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
