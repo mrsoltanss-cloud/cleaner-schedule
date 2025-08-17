@@ -37,8 +37,7 @@ TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")   # e.g. whatsapp:+14155238886
 TWILIO_WHATSAPP_TO   = os.getenv("TWILIO_WHATSAPP_TO", "")     # e.g. whatsapp:+44XXXXXXXXXX
 
-# store completion ticks (ephemeral on free plans)
-COMPLETIONS_FILE = "/tmp/completions.json"
+COMPLETIONS_FILE = "/tmp/completions.json"   # ephemeral on free tier
 
 
 # =========================
@@ -73,19 +72,17 @@ def send_whatsapp(text: str) -> bool:
 
 
 # =========================
-# ICS fetch + PARSER (patched)
+# ICS fetch + parser
 # =========================
 def fetch_calendar(ics_url: str) -> Calendar:
-    """Download and parse an ICS into an icalendar.Calendar."""
     if not ics_url:
         return Calendar()
-    headers = {"User-Agent": "CleanerScheduleBot/1.0 (+https://cleaner-schedule.onrender.com)"}
+    headers = {"User-Agent": "CleanerScheduleBot/1.0 (+cleaner-schedule.onrender.com)"}
     r = requests.get(ics_url, timeout=30, headers=headers, allow_redirects=True)
     r.raise_for_status()
     return Calendar.from_ical(r.text)
 
 def _to_date(v):
-    """Normalize icalendar values to a Python date (handles date/datetime/.dt)."""
     if isinstance(v, datetime):
         return v.date()
     if isinstance(v, date):
@@ -102,8 +99,7 @@ def _to_date(v):
 
 def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, List[Dict]]:
     """
-    Return:
-      {'Sun 17 Aug': [{'flat':'Flat7','status':'in'|'out'|'turnaround'}, ...], ...}
+    Returns: { 'Sun 17 Aug': [ {'flat':'Flat7','status':'in'|'out'|'turnaround'}, ... ], ... }
     """
     today = date.today()
     end = today + timedelta(days=days)
@@ -118,8 +114,7 @@ def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, Lis
         except Exception:
             continue
 
-        # IMPORTANT: uppercase 'VEVENT'
-        for comp in cal.walk("VEVENT"):
+        for comp in cal.walk("VEVENT"):  # UPPERCASE is important
             try:
                 s_raw = comp.get("dtstart")
                 e_raw = comp.get("dtend")
@@ -137,7 +132,7 @@ def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, Lis
             if today <= e <= end:
                 schedule.setdefault(e.strftime("%a %d %b"), []).append({"flat": flat, "status": "out"})
 
-    # Collapse same-day in+out → 'turnaround'
+    # merge same-day in+out for same flat -> turnaround
     for day, events in list(schedule.items()):
         ins  = [x for x in events if x["status"] == "in"]
         outs = [x for x in events if x["status"] == "out"]
@@ -155,7 +150,7 @@ def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, Lis
 
 
 # =========================
-# HTML (inline upload button)
+# HTML (now shows Flat + Nickname)
 # =========================
 def html_cleaner_view(schedule: Dict[str, List[Dict]], flats: Dict[str, Dict[str, str]]) -> str:
     today_str = date.today().strftime("%a %d %b")
@@ -197,7 +192,7 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
   try {{
     const res = await fetch('/upload', {{ method: 'POST', body: fd }});
     if (!res.ok) throw new Error('Upload failed');
-    const js = await res.json();
+    await res.json();
     tickEl.textContent = '✅ Cleaning completed';
     btnEl.remove(); inputEl.remove();
   }} catch (e) {{
@@ -219,12 +214,14 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
         html += f"<div class='day'><h2>{day} {badge}</h2>"
 
         for ev in events:
-            flat = ev["flat"]
-            meta = flats.get(flat, {})
-            nick = meta.get("nick", flat)
+            flat_id = ev["flat"]              # e.g., "Flat7"
+            meta = flats.get(flat_id, {})
+            nick = meta.get("nick", flat_id)  # e.g., "Orange"
             colour = meta.get("colour", "#444")
-            pill = f"<span class='pill' style='background:{colour}'>{nick}</span>"
-            done = completions.get(day, {}).get(flat, False)
+            # show BOTH: "Flat7 – Orange"
+            pill_text = f"{flat_id} – {nick}"
+            pill = f"<span class='pill' style='background:{colour}'>{pill_text}</span>"
+            done = completions.get(day, {}).get(flat_id, False)
 
             if ev["status"] == "in":
                 html += f"<p>{pill} <span class='in'>Check-in</span></p>"
@@ -253,7 +250,7 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
                         const f = document.getElementById('{fid}');
                         const b = document.getElementById('{bid}');
                         const t = document.getElementById('{tid}');
-                        f.addEventListener('change', () => uploadFor('{flat}', '{day}', f, b, t));
+                        f.addEventListener('change', () => uploadFor('{flat_id}', '{day}', f, b, t));
                       }})();
                     </script>
                     """
@@ -281,7 +278,6 @@ def cleaner(days: int = Query(14, ge=1, le=90)):
 
 @app.post("/upload", response_class=JSONResponse)
 async def upload_submit(flat: str = Form(...), date: str = Form(...), files: List[UploadFile] = File(...)):
-    # save to /tmp (ephemeral on free plan)
     saved = []
     for f in files:
         data = await f.read()
@@ -291,13 +287,13 @@ async def upload_submit(flat: str = Form(...), date: str = Form(...), files: Lis
             out.write(data)
         saved.append(safe)
 
-    # mark complete
+    # mark completed
     completions = load_completions()
     completions.setdefault(date, {})
     completions[date][flat] = True
     save_completions(completions)
 
-    # notify via WhatsApp (best effort)
+    # notify (text) – for media in WhatsApp, switch to Cloudinary/S3 URLs
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     file_list = ", ".join(saved) if saved else "no files"
     send_whatsapp(f"✅ Cleaning complete\nFlat: {flat}\nDate: {date}\nPhotos: {file_list}\nTime: {ts}")
@@ -319,6 +315,12 @@ def debug(days: int = Query(14, ge=1, le=120)):
     except Exception as e:
         lines.append(f"\nERROR building schedule: {e!r}")
     return "\n".join(lines)
+
+# optional: quick WhatsApp test
+@app.get("/test-whatsapp", response_class=PlainTextResponse)
+def test_whatsapp():
+    ok = send_whatsapp("🔔 Test from Cleaner Schedule")
+    return "sent" if ok else "failed (check env vars, sandbox join, and logs)"
 
 
 # =========================
