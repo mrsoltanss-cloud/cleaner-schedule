@@ -314,10 +314,11 @@ def debug(days: int = Query(14, ge=1, le=120)):
         sched = parse_bookings(FLATS, days)
         lines.append(f"\nDays with activity in next {days} days: {len(sched)}")
         for d in sorted(sched.keys(), key=lambda s: datetime.strptime(s, '%a %d %b')):
-            lines.append(f"  {d}: " + ", ".join([f\"{e['flat']}:{e['status']}\" for e in sched[d]]))
+            items = ", ".join([f"{e['flat']}:{e['status']}" for e in sched[d]])
+            lines.append(f"  {d}: {items}")
     except Exception as e:
-        lines.append(f\"\nERROR building schedule: {e!r}\")
-    return \"\n\".join(lines)
+        lines.append(f"\nERROR building schedule: {e!r}")
+    return "\n".join(lines)
 
 
 # =========================
