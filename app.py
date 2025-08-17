@@ -1,32 +1,49 @@
-from fastapi import FastAPI, Query, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Query, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
-import os, json, requests, uuid
-from icalendar import Calendar
 from datetime import datetime, date, timedelta
 from typing import Dict, List
+from icalendar import Calendar
 from twilio.rest import Client
+import requests, os, json, uuid
 
 app = FastAPI()
 
-# ========= CONFIG =========
+# =========================
+# Config
+# =========================
 CLEAN_WINDOW = os.getenv("CLEAN_WINDOW", "10:00–16:00")
 
 FLATS: Dict[str, Dict[str, str]] = {
-    "Flat7": {"url": os.getenv("FLAT7_ICS_URL", ""), "nick": os.getenv("FLAT7_NICK", "Orange"), "colour": os.getenv("FLAT7_COLOUR", "#FF9800")},
-    "Flat8": {"url": os.getenv("FLAT8_ICS_URL", ""), "nick": os.getenv("FLAT8_NICK", "Blue"),   "colour": os.getenv("FLAT8_COLOUR", "#2196F3")},
-    "Flat9": {"url": os.getenv("FLAT9_ICS_URL", ""), "nick": os.getenv("FLAT9_NICK", "Green"),  "colour": os.getenv("FLAT9_COLOUR", "#4CAF50")},
+    "Flat7": {
+        "url": os.getenv("FLAT7_ICS_URL", ""),
+        "nick": os.getenv("FLAT7_NICK", "Orange"),
+        "colour": os.getenv("FLAT7_COLOUR", "#FF9800"),
+    },
+    "Flat8": {
+        "url": os.getenv("FLAT8_ICS_URL", ""),
+        "nick": os.getenv("FLAT8_NICK", "Blue"),
+        "colour": os.getenv("FLAT8_COLOUR", "#2196F3"),
+    },
+    "Flat9": {
+        "url": os.getenv("FLAT9_ICS_URL", ""),
+        "nick": os.getenv("FLAT9_NICK", "Green"),
+        "colour": os.getenv("FLAT9_COLOUR", "#4CAF50"),
+    },
 }
 
-# WhatsApp (Twilio Sandbox or real WhatsApp-enabled number)
+# Twilio (WhatsApp)
 TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")   # e.g. whatsapp:+14155238886
 TWILIO_WHATSAPP_TO   = os.getenv("TWILIO_WHATSAPP_TO", "")     # e.g. whatsapp:+44XXXXXXXXXX
 
-# Completion ticks are stored here (ephemeral on free plans)
+# store completion ticks (ephemeral on free plans)
 COMPLETIONS_FILE = "/tmp/completions.json"
 
-# ========= HELPERS =========
+
+# =========================
+# Utils
+# =========================
 def load_completions() -> Dict[str, Dict[str, bool]]:
     if not os.path.exists(COMPLETIONS_FILE):
         return {}
@@ -36,7 +53,7 @@ def load_completions() -> Dict[str, Dict[str, bool]]:
     except Exception:
         return {}
 
-def save_completions(data: Dict[str, Dict[str, bool]]):
+def save_completions(data: Dict[str, Dict[str, bool]]) -> None:
     with open(COMPLETIONS_FILE, "w") as f:
         json.dump(data, f)
 
@@ -45,21 +62,49 @@ def send_whatsapp(text: str) -> bool:
         return False
     try:
         Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
-            from_=TWILIO_WHATSAPP_FROM, to=TWILIO_WHATSAPP_TO, body=text
+            from_=TWILIO_WHATSAPP_FROM,
+            to=TWILIO_WHATSAPP_TO,
+            body=text
         )
         return True
     except Exception as e:
         print("WhatsApp send failed:", e)
         return False
 
+
+# =========================
+# ICS fetch + PARSER (patched)
+# =========================
 def fetch_calendar(ics_url: str) -> Calendar:
+    """Download and parse an ICS into an icalendar.Calendar."""
     if not ics_url:
         return Calendar()
-    r = requests.get(ics_url, timeout=30)
+    headers = {"User-Agent": "CleanerScheduleBot/1.0 (+https://cleaner-schedule.onrender.com)"}
+    r = requests.get(ics_url, timeout=30, headers=headers, allow_redirects=True)
     r.raise_for_status()
     return Calendar.from_ical(r.text)
 
+def _to_date(v):
+    """Normalize icalendar values to a Python date (handles date/datetime/.dt)."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        v = v.dt
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+    except Exception:
+        pass
+    return None
+
 def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, List[Dict]]:
+    """
+    Return:
+      {'Sun 17 Aug': [{'flat':'Flat7','status':'in'|'out'|'turnaround'}, ...], ...}
+    """
     today = date.today()
     end = today + timedelta(days=days)
     schedule: Dict[str, List[Dict]] = {}
@@ -73,18 +118,26 @@ def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, Lis
         except Exception:
             continue
 
-        for comp in cal.walk("vevent"):
+        # IMPORTANT: uppercase 'VEVENT'
+        for comp in cal.walk("VEVENT"):
             try:
-                s = comp.decoded("dtstart").date()
-                e = comp.decoded("dtend").date()
+                s_raw = comp.get("dtstart")
+                e_raw = comp.get("dtend")
+                if not s_raw or not e_raw:
+                    continue
+                s = _to_date(s_raw)
+                e = _to_date(e_raw)
+                if not s or not e:
+                    continue
             except Exception:
                 continue
+
             if today <= s <= end:
                 schedule.setdefault(s.strftime("%a %d %b"), []).append({"flat": flat, "status": "in"})
             if today <= e <= end:
                 schedule.setdefault(e.strftime("%a %d %b"), []).append({"flat": flat, "status": "out"})
 
-    # same-day turnaround
+    # Collapse same-day in+out → 'turnaround'
     for day, events in list(schedule.items()):
         ins  = [x for x in events if x["status"] == "in"]
         outs = [x for x in events if x["status"] == "out"]
@@ -97,9 +150,13 @@ def parse_bookings(flats: Dict[str, Dict[str, str]], days: int) -> Dict[str, Lis
                         pass
                     events.append({"flat": o["flat"], "status": "turnaround"})
                     break
+
     return schedule
 
-# ========= HTML (inline upload) =========
+
+# =========================
+# HTML (inline upload button)
+# =========================
 def html_cleaner_view(schedule: Dict[str, List[Dict]], flats: Dict[str, Dict[str, str]]) -> str:
     today_str = date.today().strftime("%a %d %b")
     completions = load_completions()
@@ -144,16 +201,15 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
     tickEl.textContent = '✅ Cleaning completed';
     btnEl.remove(); inputEl.remove();
   }} catch (e) {{
-    alert('Upload failed. Please try again.'); 
+    alert('Upload failed. Please try again.');
     btnEl.disabled = false; btnEl.textContent = '📸 Upload Photos';
   }}
 }}
 </script>
 """
 
-    # sort days chronologically
-    def dkey(d: str) -> datetime:
-        return datetime.strptime(d, "%a %d %b")
+    def dkey(s: str) -> datetime:
+        return datetime.strptime(s, "%a %d %b")
 
     if not schedule:
         html += f"<p><b>No activity found.</b> Try a longer window: <a href='/cleaner?days=30'>/cleaner?days=30</a> or see <a href='/debug'>/debug</a>.</p>"
@@ -168,7 +224,6 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
             nick = meta.get("nick", flat)
             colour = meta.get("colour", "#444")
             pill = f"<span class='pill' style='background:{colour}'>{nick}</span>"
-
             done = completions.get(day, {}).get(flat, False)
 
             if ev["status"] == "in":
@@ -180,12 +235,10 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
                 html += f"<p>{pill} <span class='turn'>Check-out → Clean → Check-in (same day)</span></p>"
                 html += f"<div class='win'>🧹 Clean between <b>{CLEAN_WINDOW}</b></div>"
 
-            # show upload button / tick only when cleaning is needed (out/turnaround)
             if ev["status"] in ("out", "turnaround"):
                 if done:
                     html += "<p class='tick'>✅ Cleaning completed</p>"
                 else:
-                    # unique ids per card
                     fid = f"file_{uuid.uuid4().hex[:8]}"
                     bid = f"btn_{uuid.uuid4().hex[:8]}"
                     tid = f"tick_{uuid.uuid4().hex[:8]}"
@@ -196,7 +249,7 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
                       <span id="{tid}" class="tiny"></span>
                     </p>
                     <script>
-                      (function() {{
+                      (function(){{
                         const f = document.getElementById('{fid}');
                         const b = document.getElementById('{bid}');
                         const t = document.getElementById('{tid}');
@@ -204,25 +257,28 @@ async function uploadFor(flat, day, inputEl, btnEl, tickEl) {{
                       }})();
                     </script>
                     """
-
         html += "</div>"
 
     html += "</body>"
     return html
 
-# ========= ROUTES =========
+
+# =========================
+# Routes
+# =========================
 @app.get("/health", response_class=PlainTextResponse)
-def health(): return "ok"
+def health():
+    return "ok"
 
 @app.get("/", response_class=HTMLResponse)
-def root(): return "<h1>Cleaner Schedule</h1><p>Open <a href='/cleaner?days=14'>Cleaner View</a></p>"
+def root():
+    return "<h1>Cleaner Schedule</h1><p>Open <a href='/cleaner?days=14'>Cleaner View</a></p>"
 
 @app.get("/cleaner", response_class=HTMLResponse)
 def cleaner(days: int = Query(14, ge=1, le=90)):
     schedule = parse_bookings(FLATS, days)
     return html_cleaner_view(schedule, FLATS)
 
-# POST-only upload API (used by the inline button)
 @app.post("/upload", response_class=JSONResponse)
 async def upload_submit(flat: str = Form(...), date: str = Form(...), files: List[UploadFile] = File(...)):
     # save to /tmp (ephemeral on free plan)
@@ -248,7 +304,6 @@ async def upload_submit(flat: str = Form(...), date: str = Form(...), files: Lis
 
     return {"ok": True, "saved": saved}
 
-# simple diagnostics
 @app.get("/debug", response_class=PlainTextResponse)
 def debug(days: int = Query(14, ge=1, le=120)):
     lines = ["Loaded flats:"]
@@ -259,11 +314,15 @@ def debug(days: int = Query(14, ge=1, le=120)):
         sched = parse_bookings(FLATS, days)
         lines.append(f"\nDays with activity in next {days} days: {len(sched)}")
         for d in sorted(sched.keys(), key=lambda s: datetime.strptime(s, '%a %d %b')):
-            lines.append(f"  {d}: " + ", ".join([f"{e['flat']}:{e['status']}" for e in sched[d]]))
+            lines.append(f"  {d}: " + ", ".join([f\"{e['flat']}:{e['status']}\" for e in sched[d]]))
     except Exception as e:
-        lines.append(f"\nERROR building schedule: {e!r}")
-    return "\n".join(lines)
+        lines.append(f\"\nERROR building schedule: {e!r}\")
+    return \"\n\".join(lines)
 
+
+# =========================
+# Local dev
+# =========================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
