@@ -23,7 +23,7 @@ TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
 TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
 TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()
 TWILIO_WHATSAPP_TO = (os.getenv("TWILIO_WHATSAPP_TO") or "").strip()
-TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # optional template SID
+TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # optional template SID (not used by default)
 
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
@@ -44,6 +44,7 @@ except Exception:
 # App
 # ---------------------------
 app = FastAPI(title="Cleaner Schedule")
+# (Optional) expose /static if you want; we serve media via /m below
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
 
 # ---------------------------
@@ -158,18 +159,14 @@ def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None)
     if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
         return
     try:
-        args = {
-            "from_": TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}",
-            "to":    TWILIO_WHATSAPP_TO if TWILIO_WHATSAPP_TO.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_TO}",
-        }
-        if TWILIO_CONTENT_SID:
-            # If you later want to use a template, switch to content_sid flow here
-            pass
+        from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
+        to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_TO}"
         if media_urls:
-            twilio_client.messages.create(**args, body=caption, media_url=media_urls)
+            twilio_client.messages.create(from_=from_num, to=to_num, body=caption, media_url=media_urls)
         else:
-            twilio_client.messages.create(**args, body=caption)
+            twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
     except Exception:
+        # don't crash the app on Twilio issues
         pass
 
 # ---------------------------
@@ -198,8 +195,24 @@ BASE_CSS = f"""
   .btn {{ margin-left:auto; background:#1976d2; color:#fff; text-decoration:none; padding:8px 12px; border-radius:10px; font-weight:700 }}
   .strike {{ text-decoration: line-through; color:#9aa1a9; }}
   .done {{ background:#16a34a; color:#fff; padding:2px 8px; border-radius:999px; font-weight:800; font-size:12px }}
+  .tasks {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:6px 14px; margin:10px 0 6px; }}
+  .tasks label {{ display:flex; align-items:center; gap:8px; font-size:14px; }}
+  .card{{ background:#fff; border-radius:14px; padding:16px; box-shadow:0 1px 2px rgba(0,0,0,.05); border:1px solid #eee; }}
 </style>
 """
+
+TASK_LABELS = [
+    "Floors swept / vacuumed",
+    "Floors mopped",
+    "Beds made with fresh linen",
+    "Bathroom cleaned (toilet, sink, shower)",
+    "Towels replaced",
+    "Bins emptied & bags replaced",
+    "Mirrors & glass cleaned",
+    "Kitchen wiped (surfaces, hob, sink)",
+    "Toiletries & toilet roll restocked",
+    "Final check (lights off, windows/doors locked)",
+]
 
 def html_page(body: str) -> str:
     return f"""<!doctype html>
@@ -226,7 +239,6 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
             has_out = it["out"]
             has_in = it["in"]
             same_day = has_out and has_in
-            # completion flag
             completed = is_completed(it["flat"], day_iso)
 
             chip = f'<span class="pill"><span class="dot" style="background:{it["colour"]}"></span>{it["nick"]}</span>'
@@ -242,16 +254,16 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
             clean_html = ""
             if has_out:
                 line = f'🧹 Clean between <b>{CLEAN_START}–{CLEAN_END}</b>'
-                clean_html = f'<span class="note {"strike" if completed else ""}">{line}</span>'
+                cls = "note strike" if completed else "note"
+                clean_html = f'<span class="{cls}">{line}</span>'
 
-            # Upload button visible ONLY on checkout/same-day (hide on pure check-in)
+            # Upload button visible ONLY on checkout/same-day
             btn = ""
-            if has_out:  # same-day implies has_out True
+            if has_out:
                 upload_href = f'/upload?flat={it["flat"].replace(" ", "%20")}&date={day_iso}'
                 btn_text = "📷 Upload Photos" if not completed else "📷 Add more photos"
                 btn = f'<a class="btn" href="{upload_href}">{btn_text}</a>'
 
-            # Completed badge
             done_badge = ' <span class="done">✔ Completed</span>' if completed else ""
 
             row = f'<div class="row">{chip} {" ".join(status_bits)} {turn} {clean_html} {btn}{done_badge}</div>'
@@ -305,21 +317,39 @@ def serve_media(fname: str):
 
 # Upload flow: GET form + POST handler
 def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
+    # Build tasks checkboxes
+    checks: List[str] = []
+    for i, label in enumerate(TASK_LABELS, start=1):
+        checks.append(f'<label><input type="checkbox" name="tasks" value="{label}"> {label}</label>')
+    tasks_html = '<div class="tasks">' + "".join(checks) + "</div>"
+
     note = f'<p style="color:#2e7d32;font-weight:700">{msg}</p>' if msg else ""
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload</title>{BASE_CSS}</head>
 <body>
   <h1>Upload Photos</h1>
   {note}
-  <div class="day">
-    <h2>{flat} — {the_date}</h2>
-    <form action="/upload" method="post" enctype="multipart/form-data" style="display:grid;gap:10px">
+  <div class="card">
+    <h2 style="margin-top:0">{flat} — {the_date}</h2>
+    <form action="/upload" method="post" enctype="multipart/form-data" style="display:grid;gap:12px">
       <input type="hidden" name="flat" value="{flat}">
       <input type="hidden" name="date" value="{the_date}">
-      <label>Photos (you can select multiple)</label>
-      <input type="file" name="photos" multiple accept="image/*">
-      <label>Notes (optional)</label>
-      <textarea name="notes" placeholder="anything i should know ?" style="min-height:90px"></textarea>
+
+      <div>
+        <div style="font-weight:700;margin-bottom:6px">Tasks completed (tick all that apply)</div>
+        {tasks_html}
+      </div>
+
+      <div>
+        <label>Photos (you can select multiple)</label>
+        <input type="file" name="photos" multiple accept="image/*">
+      </div>
+
+      <div>
+        <label>Notes (optional)</label>
+        <textarea name="notes" placeholder="anything i should know ?" style="min-height:90px"></textarea>
+      </div>
+
       <div>
         <button type="submit" style="background:#1976d2;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Send</button>
         <a href="/cleaner" style="margin-left:8px">Back</a>
@@ -338,9 +368,14 @@ async def upload_submit(
     flat: str = Form(...),
     date: str = Form(...),
     notes: str = Form(""),
+    tasks: List[str] = Form(None),  # multiple checkboxes named "tasks"
     photos: List[UploadFile] = File(default_factory=list),
 ):
-    # Save files with UUID names
+    # Normalize tasks
+    tasks = tasks or []
+    tasks_line = ", ".join(tasks) if tasks else "None"
+
+    # Save files with UUID names and build public URLs
     saved_urls: List[str] = []
     for f in photos or []:
         try:
@@ -357,14 +392,15 @@ async def upload_submit(
         except Exception:
             continue
 
-    # Mark this flat/day as completed (for strike-through)
+    # Mark this flat/day as completed
     set_completed(flat, date)
 
-    # Build caption and send WA (free-form; within 24h window)
+    # Build caption and send WA (free-form within 24h)
     caption_lines = [
         "🧹 Cleaning update",
         f"Flat: {flat}",
         f"Date: {date}",
+        f"Tasks: {tasks_line}",
         f"Photos: {len(saved_urls)}",
     ]
     if notes.strip():
