@@ -1,6 +1,8 @@
 # app.py
 import os
 import uuid
+import json
+import threading
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -32,6 +34,48 @@ UPLOAD_DIR = "/tmp/uploads"          # actual image files
 MARK_DIR = "/tmp/marks"              # completion markers
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(MARK_DIR, exist_ok=True)
+
+# ======== NEW: Simple counter store (file + lock) ========
+COUNTER_FILE = os.getenv("COUNTER_FILE", "/tmp/clean_counter.json")
+COUNTER_PASSWORD = (os.getenv("COUNTER_PASSWORD") or "").strip()  # set this in your env
+COUNTER_LOCK = threading.Lock()
+
+def _ensure_counter_file():
+    if not os.path.exists(COUNTER_FILE):
+        with open(COUNTER_FILE, "w") as f:
+            json.dump({"count": 0}, f)
+
+def _read_counter_value() -> int:
+    _ensure_counter_file()
+    try:
+        with open(COUNTER_FILE, "r") as f:
+            return int(json.load(f).get("count", 0))
+    except Exception:
+        return 0
+
+def _write_counter_value(v: int):
+    try:
+        with open(COUNTER_FILE, "w") as f:
+            json.dump({"count": max(0, int(v))}, f)
+    except Exception:
+        pass
+
+def get_counter() -> int:
+    with COUNTER_LOCK:
+        return _read_counter_value()
+
+def set_counter(v: int) -> int:
+    with COUNTER_LOCK:
+        _write_counter_value(v)
+        return v
+
+def bump_counter(delta: int = 1) -> int:
+    with COUNTER_LOCK:
+        c = _read_counter_value()
+        c = max(0, c + int(delta))
+        _write_counter_value(c)
+        return c
+# =========================================================
 
 # Optional Twilio import
 try:
@@ -180,7 +224,9 @@ BASE_CSS = f"""
   }}
   body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial; margin:24px; background:var(--bg); color:#111; }}
   h1 {{ margin:0 0 8px }}
-  .legend {{ color:var(--muted); margin-bottom:16px }}
+  .legend {{ color:var(--muted); margin-bottom:12px }}
+  .counter-badge {{ display:inline-flex; align-items:center; gap:8px; background:#fff; border:1px solid #eee; border-radius:12px; padding:6px 10px; font-weight:700; margin-bottom:16px }}
+  .counter-badge a {{ margin-left:8px; font-weight:600; font-size:13px }}
   .day {{ background:var(--card); border:1px solid #eee; border-radius:14px; padding:16px; margin:16px 0; box-shadow:0 2px 6px rgba(0,0,0,.04); }}
   .day h2 {{ margin:0 0 10px; display:flex; align-items:center; gap:10px }}
   .today {{ background:#111; color:#fff; font-size:12px; padding:3px 8px; border-radius:999px }}
@@ -215,12 +261,15 @@ TASK_LABELS = [
 ]
 
 def html_page(body: str) -> str:
+    # NEW: inject the counter badge into the header
+    counter_html = f'<div class="counter-badge">✅ Cleans completed: <span>{get_counter()}</span> <a href="/counter">Admin</a></div>'
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cleaner Schedule</title>{BASE_CSS}</head>
 <body>
   <h1>Cleaner Schedule</h1>
   <div class="legend">Check-out in <span style="color:#d32f2f;font-weight:800">red</span> • Check-in in <span style="color:#2e7d32;font-weight:800">green</span> • <b>SAME-DAY</b> stands out • Clean {CLEAN_START}–{CLEAN_END}</div>
+  {counter_html}
   {body}
 </body></html>"""
 
@@ -362,6 +411,7 @@ def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
 def upload_form(flat: str, date: str):
     return HTMLResponse(_upload_form(flat, date))
 
+# ======== UPDATED: bump counter when first completion happens ========
 @app.post("/upload")
 async def upload_submit(
     request: Request,
@@ -394,8 +444,13 @@ async def upload_submit(
         except Exception:
             continue
 
+    # Check if this flat/day was already marked completed BEFORE we set the marker
+    already_completed = is_completed(flat, date)
     # Mark this flat/day as completed
     set_completed(flat, date)
+    # If it wasn't completed before, bump the counter by 1
+    if not already_completed:
+        bump_counter(1)
 
     # Build caption (used for the first photo)
     caption_lines = [
@@ -409,10 +464,9 @@ async def upload_submit(
         caption_lines.append(f"Notes: {notes.strip()}")
     caption = "\n".join(caption_lines)
 
-    # Send to WhatsApp: one message per photo
+    # Send to WhatsApp: one message per photo (Twilio/WhatsApp = 1 media per message)
     if saved_urls:
         for idx, url in enumerate(saved_urls):
-            # Send caption only with the first photo
             body = caption if idx == 0 else None
             wa_send_text_and_media(body or "", media_urls=[url])
     else:
@@ -420,7 +474,41 @@ async def upload_submit(
         wa_send_text_and_media(caption)
 
     return RedirectResponse(url="/cleaner", status_code=303)
+# ===================================================================
 
+# ---------------------------
+# Counter: simple admin page + APIs
+# ---------------------------
+@app.get("/api/counter")
+def api_counter_value():
+    return {"count": get_counter()}
+
+@app.get("/counter", response_class=HTMLResponse)
+def counter_page(msg: str = ""):
+    body = f"""
+    <div class="card" style="max-width:520px">
+      <h2 style="margin-top:0">Clean Counter</h2>
+      <p style="font-weight:700">Current count: {get_counter()}</p>
+      {"<p style='color:#2e7d32;font-weight:700'>" + msg + "</p>" if msg else ""}
+      <form action="/counter/reset" method="post" style="display:grid;gap:8px;max-width:360px">
+        <label>Password for reset</label>
+        <input type="password" name="password" autocomplete="current-password" style="padding:8px;border:1px solid #ddd;border-radius:8px">
+        <button type="submit" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Reset to 0</button>
+      </form>
+      <div style="margin-top:10px"><a href="/cleaner">Back to schedule</a></div>
+    </div>
+    """
+    return HTMLResponse(html_page(body))
+
+@app.post("/counter/reset")
+def counter_reset(password: str = Form("")):
+    if not COUNTER_PASSWORD:
+        # If you forgot to set a password, block resets for safety
+        return RedirectResponse(url="/counter?msg=Password%20not%20configured", status_code=303)
+    if password != COUNTER_PASSWORD:
+        return RedirectResponse(url="/counter?msg=Invalid%20password", status_code=303)
+    set_counter(0)
+    return RedirectResponse(url="/counter?msg=Counter%20reset%20to%200", status_code=303)
 
 # ---------------------------
 # Local run
