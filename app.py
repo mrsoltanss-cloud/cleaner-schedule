@@ -420,9 +420,21 @@ def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
   </div>
 </body></html>"""
 
-@app.get("/upload", response_class=HTMLResponse)
-def upload_form(flat: str, date: str):
-    return HTMLResponse(_upload_form(flat, date))
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+    <html>
+      <head><title>Login</title></head>
+      <body style='font-family:Arial;max-width:400px;margin:40px auto;'>
+        <h2>🔑 Cleaner Login</h2>
+        <form method='post' action='/login'>
+          <input type='password' name='password' placeholder='Enter password' style='padding:8px;width:100%;margin-bottom:10px'>
+          <button type='submit' style='padding:8px 12px'>Login</button>
+        </form>
+      </body>
+    </html>
+    """
+
 
 # ======== UPDATED: bump counter when first completion happens ========
 @app.post("/upload")
