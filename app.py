@@ -3,6 +3,8 @@ import os
 import uuid
 import json
 import threading
+from fastapi import Cookie
+from fastapi.responses import RedirectResponse
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -19,6 +21,15 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/London")
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "14"))
 CLEAN_START = os.getenv("CLEAN_START", "10:00")
 CLEAN_END = os.getenv("CLEAN_END", "16:00")
+APP_PASSWORD = (os.getenv("APP_PASSWORD") or "").strip()
+SESSION_COOKIE = "cleaner_auth"
+
+def check_auth(password_cookie: str = Cookie(default="")) -> bool:
+    """
+    Returns True if the user has a valid auth cookie.
+    """
+    return APP_PASSWORD and password_cookie == APP_PASSWORD
+
 
 # Twilio (optional)
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
@@ -328,7 +339,9 @@ def root():
     return "OK"
 
 @app.get("/cleaner", response_class=HTMLResponse)
-def cleaner(days: int = DEFAULT_DAYS):
+def cleaner(days: int = DEFAULT_DAYS, password_cookie: str = Cookie(default="")):
+    if not check_auth(password_cookie):
+        return RedirectResponse(url="/login")
     schedule = build_schedule(days)
     return HTMLResponse(html_page(render_schedule(schedule, days)))
 
@@ -474,6 +487,96 @@ async def upload_submit(
         wa_send_text_and_media(caption)
 
     return RedirectResponse(url="/cleaner", status_code=303)
+    @app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Soltan Living - Login</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          background:#f7f7f8;
+          display:flex;
+          justify-content:center;
+          align-items:center;
+          height:100vh;
+          margin:0;
+        }
+        .card {
+          background:#fff;
+          padding:40px 30px;
+          border-radius:14px;
+          box-shadow:0 4px 10px rgba(0,0,0,0.08);
+          width:320px;
+          text-align:center;
+        }
+        h1 {
+          margin:0 0 20px;
+          font-size:22px;
+          color:#111827;
+        }
+        .brand {
+          font-size:26px;
+          font-weight:bold;
+          color:#1976d2;
+          margin-bottom:20px;
+        }
+        input {
+          width:100%;
+          padding:12px;
+          margin:10px 0 20px;
+          border:1px solid #ddd;
+          border-radius:8px;
+          font-size:16px;
+        }
+        button {
+          background:#1976d2;
+          color:#fff;
+          border:none;
+          padding:12px 16px;
+          border-radius:8px;
+          font-weight:bold;
+          font-size:16px;
+          cursor:pointer;
+          width:100%;
+        }
+        button:hover {
+          background:#145aa0;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="brand">Soltan Living</div>
+        <h1>Cleaner Login</h1>
+        <form method="post" action="/login">
+          <input type="password" name="password" placeholder="Enter password" required>
+          <button type="submit">Login</button>
+        </form>
+      </div>
+    </body>
+    </html>
+    """
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    pw = form.get("password", "")
+    if pw == APP_PASSWORD:
+        resp = RedirectResponse(url="/cleaner", status_code=303)
+        resp.set_cookie(SESSION_COOKIE, APP_PASSWORD, httponly=True, max_age=60*60*12)  # 12h session
+        return resp
+    return RedirectResponse(url="/login", status_code=303)
+
+@app.get("/logout")
+def logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
 # ===================================================================
 
 # ---------------------------
