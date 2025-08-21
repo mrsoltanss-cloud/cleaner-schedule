@@ -381,8 +381,10 @@ async def upload_submit(
         try:
             ext = ".jpg"
             lf = (f.filename or "").lower()
-            if lf.endswith(".png"): ext = ".png"
-            elif lf.endswith(".webp"): ext = ".webp"
+            if lf.endswith(".png"):
+                ext = ".png"
+            elif lf.endswith(".webp"):
+                ext = ".webp"
             fname = f"{uuid.uuid4().hex}{ext}"
             dest = os.path.join(UPLOAD_DIR, fname)
             with open(dest, "wb") as w:
@@ -395,7 +397,7 @@ async def upload_submit(
     # Mark this flat/day as completed
     set_completed(flat, date)
 
-    # Build caption and send WA (free-form within 24h)
+    # Build caption (used for the first photo)
     caption_lines = [
         "🧹 Cleaning update",
         f"Flat: {flat}",
@@ -405,9 +407,20 @@ async def upload_submit(
     ]
     if notes.strip():
         caption_lines.append(f"Notes: {notes.strip()}")
-    wa_send_text_and_media("\n".join(caption_lines), media_urls=saved_urls)
+    caption = "\n".join(caption_lines)
+
+    # Send to WhatsApp: one message per photo
+    if saved_urls:
+        for idx, url in enumerate(saved_urls):
+            # Send caption only with the first photo
+            body = caption if idx == 0 else None
+            wa_send_text_and_media(body or "", media_urls=[url])
+    else:
+        # No photos: send text-only update
+        wa_send_text_and_media(caption)
 
     return RedirectResponse(url="/cleaner", status_code=303)
+
 
 # ---------------------------
 # Local run
