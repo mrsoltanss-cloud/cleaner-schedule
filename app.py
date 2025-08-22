@@ -148,90 +148,138 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
     return schedule
 
 # ---------------------------
-# Database-backed completions and counter
+# Completion markers + Counter (Postgres-backed with safe fallback)
 # ---------------------------
-
-import psycopg2
 import os
 
-def _db_conn():
-    return psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
+# 1) Try to import psycopg2; fall back gracefully if missing
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
 
-def _db_init():
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+def _pg_conn():
+    # If psycopg2 not installed or no URL, raise to trigger fallback
+    if not psycopg2 or not DATABASE_URL:
+        raise RuntimeError("DB not available")
+    # Many Render URLs already include sslmode=require. Let psycopg2 parse it from the URL.
+    return psycopg2.connect(DATABASE_URL)
+
+def _db_init() -> bool:
+    """Create tables if needed. Return True if DB usable, else False (app will fall back)."""
     try:
-        conn = _db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS completions (
-                id TEXT PRIMARY KEY
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS counter (
-                id SERIAL PRIMARY KEY,
-                value INT NOT NULL
-            );
-        """)
-        # Ensure one row exists for counter
-        cur.execute("SELECT COUNT(*) FROM counter;")
-        if cur.fetchone()[0] == 0:
-            cur.execute("INSERT INTO counter (value) VALUES (0);")
-        conn.commit()
-        cur.close()
+        conn = _pg_conn()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # One row per (flat, day). Counter = COUNT(*) from this table.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS completed_cleans (
+                    flat TEXT NOT NULL,
+                    day  DATE NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (flat, day)
+                );
+            """)
         conn.close()
         return True
     except Exception as e:
-        print("DB init failed:", e)
+        # Log to console, but don’t crash app
+        print("DB init failed, using file fallback:", repr(e))
         return False
 
 USE_DB = _db_init()
 
-def mark_completed(clean_id):
-    if not USE_DB: return
-    conn = _db_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO completions (id) VALUES (%s) ON CONFLICT DO NOTHING;", (clean_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+def mark_path(flat: str, day_iso: str) -> str:
+    # File fallback path (your app already uses MARK_DIR)
+    safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return os.path.join(MARK_DIR, f"{day_iso}__{safe_flat}.done")
 
-def is_completed(clean_id):
-    if not USE_DB: return False
-    conn = _db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM completions WHERE id=%s;", (clean_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return bool(result)
+def is_completed(flat: str, day_iso: str) -> bool:
+    if USE_DB:
+        try:
+            conn = _pg_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM completed_cleans WHERE flat=%s AND day=%s", (flat, day_iso))
+                found = cur.fetchone() is not None
+            conn.close()
+            return found
+        except Exception as e:
+            print("DB is_completed error, fallback:", repr(e))
+    # Fallback to file marker
+    return os.path.exists(mark_path(flat, day_iso))
 
-def get_counter():
-    if not USE_DB: return 0
-    conn = _db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM counter LIMIT 1;")
-    val = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return val
+def set_completed(flat: str, day_iso: str) -> None:
+    if USE_DB:
+        try:
+            conn = _pg_conn()
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO completed_cleans(flat, day) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (flat, day_iso),
+                )
+            conn.close()
+            return
+        except Exception as e:
+            print("DB set_completed error, fallback:", repr(e))
+    # Fallback to file marker
+    try:
+        with open(mark_path(flat, day_iso), "w") as f:
+            f.write("ok")
+    except Exception:
+        pass
 
-def set_counter(val):
-    if not USE_DB: return
-    conn = _db_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE counter SET value=%s WHERE id=1;", (val,))
-    conn.commit()
-    cur.close()
-    conn.close()
+def get_counter() -> int:
+    if USE_DB:
+        try:
+            conn = _pg_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM completed_cleans")
+                n = int(cur.fetchone()[0])
+            conn.close()
+            return n
+        except Exception as e:
+            print("DB get_counter error, fallback:", repr(e))
+    # Fallback: count all .done files
+    try:
+        return sum(1 for n in os.listdir(MARK_DIR) if n.endswith(".done"))
+    except Exception:
+        return 0
 
-def bump_counter():
-    if not USE_DB: return
-    conn = _db_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE counter SET value = value + 1 WHERE id=1;")
-    conn.commit()
-    cur.close()
-    conn.close()
+def set_counter(v: int) -> int:
+    """We only support reset-to-zero; the counter equals number of rows."""
+    if USE_DB:
+        try:
+            v = int(v)
+            if v <= 0:
+                conn = _pg_conn()
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute("TRUNCATE TABLE completed_cleans;")
+                conn.close()
+                return 0
+            # Non-zero set isn’t supported; just return current
+            return get_counter()
+        except Exception as e:
+            print("DB set_counter error, fallback:", repr(e))
+    # Fallback: delete all marker files
+    try:
+        for n in os.listdir(MARK_DIR):
+            if n.endswith(".done"):
+                try:
+                    os.remove(os.path.join(MARK_DIR, n))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return 0
+
+def bump_counter(delta: int = 1) -> int:
+    """No-op with DB because the counter is derived from rows."""
+    return get_counter()
+
 
 
 # Simple counter store (file + lock)
