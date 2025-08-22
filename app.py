@@ -200,6 +200,7 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
 def _pg_conn():
     if not psycopg2 or not DATABASE_URL:
         raise RuntimeError("DB not available")
+    # Render Postgres supports SSL; no explicit sslmode needed here
     return psycopg2.connect(DATABASE_URL)
 
 def _db_init() -> bool:
@@ -208,23 +209,22 @@ def _db_init() -> bool:
         conn.autocommit = True
         with conn.cursor() as cur:
             # Completed rows (one per flat/day)
-      cur.execute("""
-    CREATE TABLE IF NOT EXISTS counter_offset (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        clean_offset INTEGER NOT NULL DEFAULT 0
-    );
-""")
-cur.execute("INSERT INTO counter_offset (id, clean_offset) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;")
-
-
-            # Manual offset so + / - can adjust total
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS completed_cleans (
+                    flat TEXT NOT NULL,
+                    day  DATE NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (flat, day)
+                );
+            """)
+            # Manual offset so + / - can adjust total (avoid reserved word 'offset')
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS counter_offset (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
-                    offset INTEGER NOT NULL DEFAULT 0
+                    clean_offset INTEGER NOT NULL DEFAULT 0
                 );
             """)
-            cur.execute("INSERT INTO counter_offset (id, offset) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;")
+            cur.execute("INSERT INTO counter_offset (id, clean_offset) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;")
         conn.close()
         return True
     except Exception as e:
@@ -249,7 +249,8 @@ def _db_get_offset() -> int:
     conn = _pg_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT clean_offset FROM counter_offset WHERE id=1;")
-        val = int(cur.fetchone()[0])
+        row = cur.fetchone()
+        val = int(row[0]) if row else 0
     conn.close()
     return val
 
@@ -259,7 +260,6 @@ def _db_set_offset(v: int) -> None:
     with conn.cursor() as cur:
         cur.execute("UPDATE counter_offset SET clean_offset=%s WHERE id=1;", (int(v),))
     conn.close()
-
 
 def is_completed(flat: str, day_iso: str) -> bool:
     if USE_DB:
