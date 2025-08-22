@@ -8,9 +8,26 @@ from typing import Dict, List, Tuple, Optional
 
 import requests
 from icalendar import Calendar
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+
+# Optional DB + image libs
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
+
+# HEIC -> JPG conversion (optional)
+try:
+    from PIL import Image
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+except Exception:
+    Image = None
 
 # ---------------------------
 # Config
@@ -20,24 +37,33 @@ DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "14"))
 CLEAN_START = os.getenv("CLEAN_START", "10:00")
 CLEAN_END = os.getenv("CLEAN_END", "16:00")
 
+# Login
+APP_PASSWORD = (os.getenv("APP_PASSWORD") or "").strip()
+SESSION_COOKIE = "cleaner_auth"
+
+# Counter admin PIN
+COUNTER_PASSWORD = (os.getenv("COUNTER_PASSWORD") or "").strip()
+
 # Twilio (optional)
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
 TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
 TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()
 TWILIO_WHATSAPP_TO = (os.getenv("TWILIO_WHATSAPP_TO") or "").strip()
-TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # optional template SID (not used by default)
+TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # not used
 
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
+# Database
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
 # Upload dirs
-UPLOAD_DIR = "/tmp/uploads"          # actual image files
-MARK_DIR = "/tmp/marks"              # completion markers
+UPLOAD_DIR = "/tmp/uploads"          # actual image files (publicly served)
+MARK_DIR = "/tmp/marks"              # file fallback markers
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(MARK_DIR, exist_ok=True)
 
-# ======== NEW: Simple counter store (file + lock) ========
+# ======== File counter fallback (kept, but DB will override) ========
 COUNTER_FILE = os.getenv("COUNTER_FILE", "/tmp/clean_counter.json")
-COUNTER_PASSWORD = (os.getenv("COUNTER_PASSWORD") or "").strip()  # set this in your env
 COUNTER_LOCK = threading.Lock()
 
 def _ensure_counter_file():
@@ -59,22 +85,6 @@ def _write_counter_value(v: int):
             json.dump({"count": max(0, int(v))}, f)
     except Exception:
         pass
-
-def get_counter() -> int:
-    with COUNTER_LOCK:
-        return _read_counter_value()
-
-def set_counter(v: int) -> int:
-    with COUNTER_LOCK:
-        _write_counter_value(v)
-        return v
-
-def bump_counter(delta: int = 1) -> int:
-    with COUNTER_LOCK:
-        c = _read_counter_value()
-        c = max(0, c + int(delta))
-        _write_counter_value(c)
-        return c
 # =========================================================
 
 # Optional Twilio import
@@ -88,8 +98,13 @@ except Exception:
 # App
 # ---------------------------
 app = FastAPI(title="Cleaner Schedule")
-# (Optional) expose /static if you want; we serve media via /m below
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
+
+# ---------------------------
+# Auth helpers
+# ---------------------------
+def check_auth(session_token: Optional[str]) -> bool:
+    return bool(APP_PASSWORD) and (session_token == APP_PASSWORD)
 
 # ---------------------------
 # Flats & ICS helpers
@@ -180,38 +195,163 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
     return schedule
 
 # ---------------------------
-# Completion markers
+# DB-backed completion markers + counter (with file fallback)
 # ---------------------------
+def _pg_conn():
+    if not psycopg2 or not DATABASE_URL:
+        raise RuntimeError("DB not available")
+    return psycopg2.connect(DATABASE_URL)
+
+def _db_init() -> bool:
+    try:
+        conn = _pg_conn()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # Completed rows (one per flat/day)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS completed_cleans (
+                    flat TEXT NOT NULL,
+                    day  DATE NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (flat, day)
+                );
+            """)
+            # Manual offset so + / - can adjust total
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS counter_offset (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    offset INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+            cur.execute("INSERT INTO counter_offset (id, offset) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;")
+        conn.close()
+        return True
+    except Exception as e:
+        print("DB init failed, using file fallback:", repr(e))
+        return False
+
+USE_DB = _db_init()
+
 def mark_path(flat: str, day_iso: str) -> str:
     safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
     return os.path.join(MARK_DIR, f"{day_iso}__{safe_flat}.done")
 
+def _db_completed_count() -> int:
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM completed_cleans;")
+        n = int(cur.fetchone()[0])
+    conn.close()
+    return n
+
+def _db_get_offset() -> int:
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT offset FROM counter_offset WHERE id=1;")
+        val = int(cur.fetchone()[0])
+    conn.close()
+    return val
+
+def _db_set_offset(v: int) -> None:
+    conn = _pg_conn()
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("UPDATE counter_offset SET offset=%s WHERE id=1;", (int(v),))
+    conn.close()
+
 def is_completed(flat: str, day_iso: str) -> bool:
+    if USE_DB:
+        try:
+            conn = _pg_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM completed_cleans WHERE flat=%s AND day=%s", (flat, day_iso))
+                found = cur.fetchone() is not None
+            conn.close()
+            return found
+        except Exception as e:
+            print("DB is_completed error, fallback:", repr(e))
     return os.path.exists(mark_path(flat, day_iso))
 
 def set_completed(flat: str, day_iso: str) -> None:
+    if USE_DB:
+        try:
+            conn = _pg_conn()
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO completed_cleans(flat, day) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (flat, day_iso),
+                )
+            conn.close()
+            return
+        except Exception as e:
+            print("DB set_completed error, fallback:", repr(e))
     try:
         with open(mark_path(flat, day_iso), "w") as f:
             f.write("ok")
     except Exception:
         pass
 
+def get_counter() -> int:
+    if USE_DB:
+        try:
+            return _db_completed_count() + _db_get_offset()
+        except Exception as e:
+            print("DB get_counter error, fallback:", repr(e))
+    # file fallback
+    with COUNTER_LOCK:
+        return _read_counter_value()
+
+def set_counter(v: int) -> int:
+    """Set total to v; with DB we adjust offset so: total = completed + offset."""
+    if USE_DB:
+        try:
+            completed = _db_completed_count()
+            _db_set_offset(int(v) - completed)
+            return get_counter()
+        except Exception as e:
+            print("DB set_counter error:", repr(e))
+            return get_counter()
+    with COUNTER_LOCK:
+        _write_counter_value(v)
+        return v
+
+def bump_counter(delta: int = 1) -> int:
+    """Manual adjust using the offset (DB) or file value (fallback)."""
+    if USE_DB:
+        try:
+            _db_set_offset(_db_get_offset() + int(delta))
+            return get_counter()
+        except Exception as e:
+            print("DB bump_counter error:", repr(e))
+            return get_counter()
+    with COUNTER_LOCK:
+        c = _read_counter_value()
+        c = max(0, c + int(delta))
+        _write_counter_value(c)
+        return c
+
 # ---------------------------
 # WhatsApp helper
 # ---------------------------
 def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None) -> None:
     if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
+        print("Twilio not configured")
         return
     try:
         from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
         to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_TO}"
         if media_urls:
-            twilio_client.messages.create(from_=from_num, to=to_num, body=caption, media_url=media_urls)
+            # send one media per message; first carries caption
+            for idx, m in enumerate(media_urls):
+                body = caption if idx == 0 else ""
+                print(f"Sending WA media: {m}")
+                twilio_client.messages.create(from_=from_num, to=to_num, body=body, media_url=[m])
         else:
+            print("Sending WA text only")
             twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
-    except Exception:
-        # don't crash the app on Twilio issues
-        pass
+    except Exception as e:
+        print("Twilio error:", repr(e))
 
 # ---------------------------
 # HTML
@@ -261,7 +401,6 @@ TASK_LABELS = [
 ]
 
 def html_page(body: str) -> str:
-    # NEW: inject the counter badge into the header
     counter_html = f'<div class="counter-badge">✅ Cleans completed: <span>{get_counter()}</span> <a href="/counter">Admin</a></div>'
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -299,14 +438,12 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
 
             turn = '<span class="turn">SAME-DAY TURNAROUND</span>' if same_day else ""
 
-            # Clean window only on checkout/same-day; strike through if completed
             clean_html = ""
             if has_out:
                 line = f'🧹 Clean between <b>{CLEAN_START}–{CLEAN_END}</b>'
                 cls = "note strike" if completed else "note"
                 clean_html = f'<span class="{cls}">{line}</span>'
 
-            # Upload button visible ONLY on checkout/same-day
             btn = ""
             if has_out:
                 upload_href = f'/upload?flat={it["flat"].replace(" ", "%20")}&date={day_iso}'
@@ -327,13 +464,66 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
 def root():
     return "OK"
 
+# ----- Login / Logout -----
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Soltan Living - Login</title>
+      <style>
+        body {font-family: Arial, sans-serif; background:#f7f7f8; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;}
+        .card {background:#fff; padding:40px 30px; border-radius:14px; box-shadow:0 4px 10px rgba(0,0,0,0.08); width:320px; text-align:center;}
+        h1 {margin:0 0 20px; font-size:22px; color:#111827;}
+        .brand {font-size:26px; font-weight:bold; color:#1976d2; margin-bottom:20px;}
+        input {width:100%; padding:12px; margin:10px 0 20px; border:1px solid #ddd; border-radius:8px; font-size:16px;}
+        button {background:#1976d2; color:#fff; border:none; padding:12px 16px; border-radius:8px; font-weight:bold; font-size:16px; cursor:pointer; width:100%;}
+        button:hover {background:#145aa0;}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="brand">Soltan Living</div>
+        <h1>Cleaner Login</h1>
+        <form method="post" action="/login">
+          <input type="password" name="password" placeholder="Enter password" required>
+          <button type="submit">Login</button>
+        </form>
+      </div>
+    </body>
+    </html>
+    """
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    pw = (form.get("password") or "").strip()
+    if APP_PASSWORD and pw == APP_PASSWORD:
+        resp = RedirectResponse(url="/cleaner", status_code=303)
+        resp.set_cookie(SESSION_COOKIE, APP_PASSWORD, httponly=True, max_age=60*60*12, samesite="lax")
+        return resp
+    return RedirectResponse(url="/login", status_code=303)
+
+@app.get("/logout")
+def logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+# ----- Protected pages -----
 @app.get("/cleaner", response_class=HTMLResponse)
-def cleaner(days: int = DEFAULT_DAYS):
+def cleaner(days: int = DEFAULT_DAYS, session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
     schedule = build_schedule(days)
     return HTMLResponse(html_page(render_schedule(schedule, days)))
 
 @app.get("/debug", response_class=PlainTextResponse)
-def debug():
+def debug(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
     flats = load_flats()
     lines = ["Loaded flats:"]
     for name, meta in flats.items():
@@ -362,16 +552,15 @@ def serve_media(fname: str):
     lf = fname.lower()
     if lf.endswith(".png"): mt = "image/png"
     if lf.endswith(".webp"): mt = "image/webp"
+    if lf.endswith(".heic"): mt = "image/heic"
     return FileResponse(path, media_type=mt)
 
 # Upload flow: GET form + POST handler
 def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
-    # Build tasks checkboxes
     checks: List[str] = []
     for i, label in enumerate(TASK_LABELS, start=1):
         checks.append(f'<label><input type="checkbox" name="tasks" value="{label}"> {label}</label>')
     tasks_html = '<div class="tasks">' + "".join(checks) + "</div>"
-
     note = f'<p style="color:#2e7d32;font-weight:700">{msg}</p>' if msg else ""
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload</title>{BASE_CSS}</head>
@@ -383,35 +572,21 @@ def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
     <form action="/upload" method="post" enctype="multipart/form-data" style="display:grid;gap:12px">
       <input type="hidden" name="flat" value="{flat}">
       <input type="hidden" name="date" value="{the_date}">
-
-      <div>
-        <div style="font-weight:700;margin-bottom:6px">Tasks completed (tick all that apply)</div>
-        {tasks_html}
-      </div>
-
-      <div>
-        <label>Photos (you can select multiple)</label>
-        <input type="file" name="photos" multiple accept="image/*">
-      </div>
-
-      <div>
-        <label>Notes (optional)</label>
-        <textarea name="notes" placeholder="anything i should know ?" style="min-height:90px"></textarea>
-      </div>
-
-      <div>
-        <button type="submit" style="background:#1976d2;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Send</button>
-        <a href="/cleaner" style="margin-left:8px">Back</a>
-      </div>
+      <div><div style="font-weight:700;margin-bottom:6px">Tasks completed (tick all that apply)</div>{tasks_html}</div>
+      <div><label>Photos (you can select multiple)</label><input type="file" name="photos" multiple accept="image/*"></div>
+      <div><label>Notes (optional)</label><textarea name="notes" placeholder="anything i should know ?" style="min-height:90px"></textarea></div>
+      <div><button type="submit" style="background:#1976d2;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Send</button>
+           <a href="/cleaner" style="margin-left:8px">Back</a></div>
     </form>
   </div>
 </body></html>"""
 
 @app.get("/upload", response_class=HTMLResponse)
-def upload_form(flat: str, date: str):
+def upload_form(flat: str, date: str, session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
     return HTMLResponse(_upload_form(flat, date))
 
-# ======== UPDATED: bump counter when first completion happens ========
 @app.post("/upload")
 async def upload_submit(
     request: Request,
@@ -420,39 +595,64 @@ async def upload_submit(
     notes: str = Form(""),
     tasks: List[str] = Form(None),  # multiple checkboxes named "tasks"
     photos: List[UploadFile] = File(default_factory=list),
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    # Normalize tasks
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+
     tasks = tasks or []
     tasks_line = ", ".join(tasks) if tasks else "None"
 
-    # Save files with UUID names and build public URLs
     saved_urls: List[str] = []
     for f in photos or []:
         try:
+            # Detect extension; convert HEIC -> JPG if possible
+            orig_name = (f.filename or "")
+            lf = orig_name.lower()
             ext = ".jpg"
-            lf = (f.filename or "").lower()
-            if lf.endswith(".png"):
-                ext = ".png"
-            elif lf.endswith(".webp"):
-                ext = ".webp"
-            fname = f"{uuid.uuid4().hex}{ext}"
-            dest = os.path.join(UPLOAD_DIR, fname)
-            with open(dest, "wb") as w:
-                w.write(await f.read())
+            if lf.endswith(".png"):  ext = ".png"
+            elif lf.endswith(".webp"): ext = ".webp"
+            elif lf.endswith(".heic"): ext = ".heic"
+
+            raw_bytes = await f.read()
+
+            # If HEIC and we have Pillow+pillow-heif, convert to JPG
+            if ext == ".heic" and Image is not None:
+                try:
+                    import io
+                    img = Image.open(io.BytesIO(raw_bytes))
+                    rgb = img.convert("RGB")
+                    fname = f"{uuid.uuid4().hex}.jpg"
+                    dest = os.path.join(UPLOAD_DIR, fname)
+                    rgb.save(dest, format="JPEG", quality=90)
+                    print(f"Converted HEIC -> JPG: {orig_name} -> {fname}")
+                except Exception as e:
+                    # Fallback: save as given (may not render in WA)
+                    fname = f"{uuid.uuid4().hex}{ext}"
+                    dest = os.path.join(UPLOAD_DIR, fname)
+                    with open(dest, "wb") as w:
+                        w.write(raw_bytes)
+                    print("HEIC convert failed, saved raw:", repr(e))
+            else:
+                # Non-HEIC (or no Pillow) -> save as-is
+                fname = f"{uuid.uuid4().hex}{ext}"
+                dest = os.path.join(UPLOAD_DIR, fname)
+                with open(dest, "wb") as w:
+                    w.write(raw_bytes)
+
             base = PUBLIC_BASE_URL or f"{request.url.scheme}://{request.url.netloc}"
             saved_urls.append(f"{base}/m/{fname}")
-        except Exception:
+        except Exception as e:
+            print("Save file error:", repr(e))
             continue
 
-    # Check if this flat/day was already marked completed BEFORE we set the marker
+    # Mark completion and bump count only once per flat/day
     already_completed = is_completed(flat, date)
-    # Mark this flat/day as completed
     set_completed(flat, date)
-    # If it wasn't completed before, bump the counter by 1
     if not already_completed:
         bump_counter(1)
 
-    # Build caption (used for the first photo)
+    # Build caption (used for first photo)
     caption_lines = [
         "🧹 Cleaning update",
         f"Flat: {flat}",
@@ -464,51 +664,71 @@ async def upload_submit(
         caption_lines.append(f"Notes: {notes.strip()}")
     caption = "\n".join(caption_lines)
 
-    # Send to WhatsApp: one message per photo (Twilio/WhatsApp = 1 media per message)
+    # Send to WhatsApp
     if saved_urls:
-        for idx, url in enumerate(saved_urls):
-            body = caption if idx == 0 else None
-            wa_send_text_and_media(body or "", media_urls=[url])
+        wa_send_text_and_media(caption, media_urls=saved_urls)
     else:
-        # No photos: send text-only update
         wa_send_text_and_media(caption)
 
     return RedirectResponse(url="/cleaner", status_code=303)
-# ===================================================================
 
 # ---------------------------
-# Counter: simple admin page + APIs
+# Counter: admin page (+ / - / reset) with PIN
 # ---------------------------
 @app.get("/api/counter")
-def api_counter_value():
+def api_counter_value(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return {"count": 0}
     return {"count": get_counter()}
 
 @app.get("/counter", response_class=HTMLResponse)
-def counter_page(msg: str = ""):
-    body = f"""
-    <div class="card" style="max-width:520px">
-      <h2 style="margin-top:0">Clean Counter</h2>
-      <p style="font-weight:700">Current count: {get_counter()}</p>
-      {"<p style='color:#2e7d32;font-weight:700'>" + msg + "</p>" if msg else ""}
-      <form action="/counter/reset" method="post" style="display:grid;gap:8px;max-width:360px">
-        <label>Password for reset</label>
-        <input type="password" name="password" autocomplete="current-password" style="padding:8px;border:1px solid #ddd;border-radius:8px">
-        <button type="submit" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Reset to 0</button>
-      </form>
-      <div style="margin-top:10px"><a href="/cleaner">Back to schedule</a></div>
-    </div>
-    """
+def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+    pin_field = ""
+    if COUNTER_PASSWORD:
+        pin_field = (
+            '<input type="password" name="pin" placeholder="PIN" '
+            'style="padding:8px;border:1px solid #ddd;border-radius:8px;min-width:100px">'
+        )
+    body = (
+        '<div class="card" style="max-width:520px">'
+        '<h2 style="margin-top:0">🧹 Cleans Completed Counter</h2>'
+        f'<p style="font-weight:700">Current count: {get_counter()}</p>'
+        '<form action="/counter/update" method="post" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+        f'{pin_field}'
+        '<button type="submit" name="action" value="plus" '
+        'style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➕ Add 1</button>'
+        '<button type="submit" name="action" value="minus" '
+        'style="background:#f59e0b;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➖ Subtract 1</button>'
+        '<button type="submit" name="action" value="reset" '
+        'style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">🔁 Reset</button>'
+        '</form>'
+        '<div style="margin-top:10px"><a href="/cleaner">⬅ Back to schedule</a></div>'
+        '</div>'
+    )
     return HTMLResponse(html_page(body))
 
-@app.post("/counter/reset")
-def counter_reset(password: str = Form("")):
-    if not COUNTER_PASSWORD:
-        # If you forgot to set a password, block resets for safety
-        return RedirectResponse(url="/counter?msg=Password%20not%20configured", status_code=303)
-    if password != COUNTER_PASSWORD:
-        return RedirectResponse(url="/counter?msg=Invalid%20password", status_code=303)
-    set_counter(0)
-    return RedirectResponse(url="/counter?msg=Counter%20reset%20to%200", status_code=303)
+@app.post("/counter/update")
+def counter_update(
+    action: str = Form(...),
+    pin: str = Form(default=""),
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+
+    if COUNTER_PASSWORD and pin != COUNTER_PASSWORD:
+        return RedirectResponse(url="/counter", status_code=303)
+
+    if action == "plus":
+        bump_counter(1)
+    elif action == "minus":
+        bump_counter(-1)
+    elif action == "reset":
+        set_counter(0)
+
+    return RedirectResponse(url="/counter", status_code=303)
 
 # ---------------------------
 # Local run
