@@ -622,10 +622,10 @@ def api_counter_value(session_token: Optional[str] = Cookie(default=None, alias=
         return {"count": 0}
     return {"count": get_counter()}
 
-from fastapi import Form
 
 @app.get("/counter", response_class=HTMLResponse)
 def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    # Must be logged in
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
 
@@ -634,7 +634,7 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
       <h2 style="margin-top:0">🧹 Cleans Completed Counter</h2>
       <p style="font-weight:700">Current count: {get_counter()}</p>
       <form action="/counter/update" method="post" style="display:flex;gap:10px;flex-wrap:wrap">
-        <button type="submit" name="action" value="plus" style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➕ Add 1</button>
+        <button type="submit" name="action" value="plus"  style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➕ Add 1</button>
         <button type="submit" name="action" value="minus" style="background:#f59e0b;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➖ Subtract 1</button>
         <button type="submit" name="action" value="reset" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">🔁 Reset</button>
       </form>
@@ -642,6 +642,25 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
     </div>
     """
     return HTMLResponse(html_page(body))
+
+@app.post("/counter/update")
+def counter_update(
+    action: str = Form(...),
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    # Must be logged in
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+
+    if action == "plus":
+        bump_counter(1)
+    elif action == "minus":
+        bump_counter(-1)
+    elif action == "reset":
+        set_counter(0)
+
+    return RedirectResponse(url="/counter", status_code=303)
+
 
 @app.post("/counter/update")
 def counter_update(action: str = Form(...), session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
