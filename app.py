@@ -1,110 +1,61 @@
-# app.py
+# app.py — Cleaner Schedule (FastAPI)
 import os
 import uuid
 import json
 import threading
-from fastapi import Cookie
-from fastapi.responses import RedirectResponse
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
 import requests
 from icalendar import Calendar
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-# ---------------------------
+# =========================
 # Config
-# ---------------------------
+# =========================
 TIMEZONE = os.getenv("TIMEZONE", "Europe/London")
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "14"))
 CLEAN_START = os.getenv("CLEAN_START", "10:00")
 CLEAN_END = os.getenv("CLEAN_END", "16:00")
+
+# Site login (single shared password)
 APP_PASSWORD = (os.getenv("APP_PASSWORD") or "").strip()
-SESSION_COOKIE = "cleaner_auth"
-
-def check_auth(password_cookie: str = Cookie(default="")) -> bool:
-    """
-    Returns True if the user has a valid auth cookie.
-    """
-    return APP_PASSWORD and password_cookie == APP_PASSWORD
-
+SESSION_COOKIE = "cleaner_auth"  # cookie name storing session
 
 # Twilio (optional)
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
-TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
+TWILIO_AUTH_TOKEN  = (os.getenv("TWILIO_AUTH_TOKEN")  or "").strip()
 TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()
-TWILIO_WHATSAPP_TO = (os.getenv("TWILIO_WHATSAPP_TO") or "").strip()
-TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # optional template SID (not used by default)
+TWILIO_WHATSAPP_TO   = (os.getenv("TWILIO_WHATSAPP_TO")   or "").strip()
 
+# Base URL used to build public media links for WhatsApp
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
-# Upload dirs
-UPLOAD_DIR = "/tmp/uploads"          # actual image files
-MARK_DIR = "/tmp/marks"              # completion markers
+# Upload/mark directories
+UPLOAD_DIR = "/tmp/uploads"   # actual image files
+MARK_DIR   = "/tmp/marks"     # completion markers (one file per flat/day)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(MARK_DIR, exist_ok=True)
+os.makedirs(MARK_DIR,   exist_ok=True)
 
-# ======== NEW: Simple counter store (file + lock) ========
-COUNTER_FILE = os.getenv("COUNTER_FILE", "/tmp/clean_counter.json")
-COUNTER_PASSWORD = (os.getenv("COUNTER_PASSWORD") or "").strip()  # set this in your env
-COUNTER_LOCK = threading.Lock()
-
-def _ensure_counter_file():
-    if not os.path.exists(COUNTER_FILE):
-        with open(COUNTER_FILE, "w") as f:
-            json.dump({"count": 0}, f)
-
-def _read_counter_value() -> int:
-    _ensure_counter_file()
-    try:
-        with open(COUNTER_FILE, "r") as f:
-            return int(json.load(f).get("count", 0))
-    except Exception:
-        return 0
-
-def _write_counter_value(v: int):
-    try:
-        with open(COUNTER_FILE, "w") as f:
-            json.dump({"count": max(0, int(v))}, f)
-    except Exception:
-        pass
-
-def get_counter() -> int:
-    with COUNTER_LOCK:
-        return _read_counter_value()
-
-def set_counter(v: int) -> int:
-    with COUNTER_LOCK:
-        _write_counter_value(v)
-        return v
-
-def bump_counter(delta: int = 1) -> int:
-    with COUNTER_LOCK:
-        c = _read_counter_value()
-        c = max(0, c + int(delta))
-        _write_counter_value(c)
-        return c
-# =========================================================
-
-# Optional Twilio import
+# Optional Twilio client
 try:
     from twilio.rest import Client as TwilioClient
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 except Exception:
     twilio_client = None
 
-# ---------------------------
+# =========================
 # App
-# ---------------------------
+# =========================
 app = FastAPI(title="Cleaner Schedule")
-# (Optional) expose /static if you want; we serve media via /m below
+# (Serving media via /m below; /static mount handy if you add assets later)
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
 
-# ---------------------------
+# =========================
 # Flats & ICS helpers
-# ---------------------------
+# =========================
 PALETTE = ["#FF9800", "#2196F3", "#4CAF50", "#9C27B0", "#E91E63", "#00BCD4", "#795548", "#3F51B5"]
 
 def load_flats(max_flats: int = 50) -> Dict[str, Dict[str, str]]:
@@ -142,6 +93,7 @@ def parse_bookings(ics_text: str) -> List[Tuple[date, date]]:
     except Exception:
         return []
     spans: List[Tuple[date, date]] = []
+
     def to_date(v) -> Optional[date]:
         try:
             if hasattr(v, "dt"):
@@ -149,13 +101,14 @@ def parse_bookings(ics_text: str) -> List[Tuple[date, date]]:
             return v.date() if isinstance(v, datetime) else v
         except Exception:
             return None
+
     for comp in cal.walk():
         if getattr(comp, "name", None) != "VEVENT":
             continue
-        ds = comp.get("DTSTART"); de = comp.get("DTEND")
+        ds = comp.get("DTSTART"); de = comp.get("DTEND")  # DTEND = checkout day
         if not ds or not de:
             continue
-        ci = to_date(ds); co = to_date(de)  # DTEND is checkout day
+        ci = to_date(ds); co = to_date(de)
         if isinstance(ci, date) and isinstance(co, date):
             spans.append((ci, co))
     return spans
@@ -190,9 +143,9 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
         schedule[day].sort(key=lambda it: (not it["out"], it["flat"].lower()))
     return schedule
 
-# ---------------------------
-# Completion markers
-# ---------------------------
+# =========================
+# Completed markers (per flat/day) + counter
+# =========================
 def mark_path(flat: str, day_iso: str) -> str:
     safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
     return os.path.join(MARK_DIR, f"{day_iso}__{safe_flat}.done")
@@ -207,9 +160,49 @@ def set_completed(flat: str, day_iso: str) -> None:
     except Exception:
         pass
 
-# ---------------------------
+# Simple counter store (file + lock)
+COUNTER_FILE = os.getenv("COUNTER_FILE", "/tmp/clean_counter.json")
+COUNTER_LOCK = threading.Lock()
+
+def _ensure_counter_file():
+    if not os.path.exists(COUNTER_FILE):
+        with open(COUNTER_FILE, "w") as f:
+            json.dump({"count": 0}, f)
+
+def _read_counter_value() -> int:
+    _ensure_counter_file()
+    try:
+        with open(COUNTER_FILE, "r") as f:
+            return int(json.load(f).get("count", 0))
+    except Exception:
+        return 0
+
+def _write_counter_value(v: int):
+    try:
+        with open(COUNTER_FILE, "w") as f:
+            json.dump({"count": max(0, int(v))}, f)
+    except Exception:
+        pass
+
+def get_counter() -> int:
+    with COUNTER_LOCK:
+        return _read_counter_value()
+
+def set_counter(v: int) -> int:
+    with COUNTER_LOCK:
+        _write_counter_value(v)
+        return v
+
+def bump_counter(delta: int = 1) -> int:
+    with COUNTER_LOCK:
+        c = _read_counter_value()
+        c = max(0, c + int(delta))
+        _write_counter_value(c)
+        return c
+
+# =========================
 # WhatsApp helper
-# ---------------------------
+# =========================
 def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None) -> None:
     if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
         return
@@ -221,12 +214,12 @@ def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None)
         else:
             twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
     except Exception:
-        # don't crash the app on Twilio issues
+        # Don't crash if Twilio has an issue
         pass
 
-# ---------------------------
-# HTML
-# ---------------------------
+# =========================
+# HTML helpers
+# =========================
 BASE_CSS = f"""
 <style>
   :root {{
@@ -272,7 +265,6 @@ TASK_LABELS = [
 ]
 
 def html_page(body: str) -> str:
-    # NEW: inject the counter badge into the header
     counter_html = f'<div class="counter-badge">✅ Cleans completed: <span>{get_counter()}</span> <a href="/counter">Admin</a></div>'
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -310,14 +302,12 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
 
             turn = '<span class="turn">SAME-DAY TURNAROUND</span>' if same_day else ""
 
-            # Clean window only on checkout/same-day; strike through if completed
             clean_html = ""
             if has_out:
                 line = f'🧹 Clean between <b>{CLEAN_START}–{CLEAN_END}</b>'
                 cls = "note strike" if completed else "note"
                 clean_html = f'<span class="{cls}">{line}</span>'
 
-            # Upload button visible ONLY on checkout/same-day
             btn = ""
             if has_out:
                 upload_href = f'/upload?flat={it["flat"].replace(" ", "%20")}&date={day_iso}'
@@ -331,9 +321,18 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
         parts.append("</div>")
     return "\n".join(parts)
 
-# ---------------------------
+# =========================
+# Auth helpers (custom login page)
+# =========================
+def check_auth(password_cookie: str = Cookie(default="")) -> bool:
+    """
+    True if a valid session cookie is present.
+    """
+    return bool(APP_PASSWORD) and (password_cookie == APP_PASSWORD)
+
+# =========================
 # Routes
-# ---------------------------
+# =========================
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return "OK"
@@ -346,7 +345,9 @@ def cleaner(days: int = DEFAULT_DAYS, password_cookie: str = Cookie(default=""))
     return HTMLResponse(html_page(render_schedule(schedule, days)))
 
 @app.get("/debug", response_class=PlainTextResponse)
-def debug():
+def debug(password_cookie: str = Cookie(default="")):
+    if not check_auth(password_cookie):
+        return RedirectResponse(url="/login")
     flats = load_flats()
     lines = ["Loaded flats:"]
     for name, meta in flats.items():
@@ -365,7 +366,7 @@ def debug():
     lines.append(f"\nDays with activity in next 14 days: {len(schedule)}")
     return "\n".join(lines)
 
-# Serve uploaded media (public for Twilio)
+# Serve uploaded media (public; Twilio needs to fetch)
 @app.get("/m/{fname}")
 def serve_media(fname: str):
     path = os.path.join(UPLOAD_DIR, fname)
@@ -373,18 +374,16 @@ def serve_media(fname: str):
         raise HTTPException(status_code=404, detail="Not found")
     mt = "image/jpeg"
     lf = fname.lower()
-    if lf.endswith(".png"): mt = "image/png"
+    if lf.endswith(".png"):  mt = "image/png"
     if lf.endswith(".webp"): mt = "image/webp"
     return FileResponse(path, media_type=mt)
 
-# Upload flow: GET form + POST handler
+# Upload form (GET)
 def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
-    # Build tasks checkboxes
     checks: List[str] = []
-    for i, label in enumerate(TASK_LABELS, start=1):
+    for label in TASK_LABELS:
         checks.append(f'<label><input type="checkbox" name="tasks" value="{label}"> {label}</label>')
     tasks_html = '<div class="tasks">' + "".join(checks) + "</div>"
-
     note = f'<p style="color:#2e7d32;font-weight:700">{msg}</p>' if msg else ""
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload</title>{BASE_CSS}</head>
@@ -420,46 +419,36 @@ def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
   </div>
 </body></html>"""
 
-@app.get("/login", response_class=HTMLResponse)
-def login_page():
-    return """
-    <html>
-      <head><title>Login</title></head>
-      <body style='font-family:Arial;max-width:400px;margin:40px auto;'>
-        <h2>🔑 Cleaner Login</h2>
-        <form method='post' action='/login'>
-          <input type='password' name='password' placeholder='Enter password' style='padding:8px;width:100%;margin-bottom:10px'>
-          <button type='submit' style='padding:8px 12px'>Login</button>
-        </form>
-      </body>
-    </html>
-    """
+@app.get("/upload", response_class=HTMLResponse)
+def upload_form(flat: str, date: str, password_cookie: str = Cookie(default="")):
+    if not check_auth(password_cookie):
+        return RedirectResponse(url="/login")
+    return HTMLResponse(_upload_form(flat, date))
 
-
-# ======== UPDATED: bump counter when first completion happens ========
+# Upload submit (POST) — saves files, bumps counter (first time), sends WA (one msg per photo)
 @app.post("/upload")
 async def upload_submit(
     request: Request,
     flat: str = Form(...),
     date: str = Form(...),
     notes: str = Form(""),
-    tasks: List[str] = Form(None),  # multiple checkboxes named "tasks"
+    tasks: List[str] = Form(None),
     photos: List[UploadFile] = File(default_factory=list),
+    password_cookie: str = Cookie(default=""),
 ):
-    # Normalize tasks
+    if not check_auth(password_cookie):
+        return RedirectResponse(url="/login")
+
     tasks = tasks or []
     tasks_line = ", ".join(tasks) if tasks else "None"
 
-    # Save files with UUID names and build public URLs
     saved_urls: List[str] = []
     for f in photos or []:
         try:
             ext = ".jpg"
             lf = (f.filename or "").lower()
-            if lf.endswith(".png"):
-                ext = ".png"
-            elif lf.endswith(".webp"):
-                ext = ".webp"
+            if lf.endswith(".png"):  ext = ".png"
+            elif lf.endswith(".webp"): ext = ".webp"
             fname = f"{uuid.uuid4().hex}{ext}"
             dest = os.path.join(UPLOAD_DIR, fname)
             with open(dest, "wb") as w:
@@ -469,15 +458,13 @@ async def upload_submit(
         except Exception:
             continue
 
-    # Check if this flat/day was already marked completed BEFORE we set the marker
+    # Bump counter only the first time this flat/day is completed
     already_completed = is_completed(flat, date)
-    # Mark this flat/day as completed
     set_completed(flat, date)
-    # If it wasn't completed before, bump the counter by 1
     if not already_completed:
         bump_counter(1)
 
-    # Build caption (used for the first photo)
+    # Caption
     caption_lines = [
         "🧹 Cleaning update",
         f"Flat: {flat}",
@@ -489,17 +476,53 @@ async def upload_submit(
         caption_lines.append(f"Notes: {notes.strip()}")
     caption = "\n".join(caption_lines)
 
-    # Send to WhatsApp: one message per photo (Twilio/WhatsApp = 1 media per message)
+    # WhatsApp: one message per photo (Twilio/WhatsApp supports 1 media per message)
     if saved_urls:
         for idx, url in enumerate(saved_urls):
             body = caption if idx == 0 else None
             wa_send_text_and_media(body or "", media_urls=[url])
     else:
-        # No photos: send text-only update
         wa_send_text_and_media(caption)
 
     return RedirectResponse(url="/cleaner", status_code=303)
-    @app.get("/login", response_class=HTMLResponse)
+
+# =========================
+# Counter admin (requires login)
+# =========================
+@app.get("/api/counter")
+def api_counter_value(password_cookie: str = Cookie(default="")):
+    if not check_auth(password_cookie):
+        return {"count": 0}
+    return {"count": get_counter()}
+
+@app.get("/counter", response_class=HTMLResponse)
+def counter_page(msg: str = "", password_cookie: str = Cookie(default="")):
+    if not check_auth(password_cookie):
+        return RedirectResponse(url="/login")
+    body = f"""
+    <div class="card" style="max-width:520px">
+      <h2 style="margin-top:0">Clean Counter</h2>
+      <p style="font-weight:700">Current count: {get_counter()}</p>
+      {"<p style='color:#2e7d32;font-weight:700'>" + msg + "</p>" if msg else ""}
+      <form action="/counter/reset" method="post" style="display:grid;gap:8px;max-width:360px">
+        <button type="submit" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Reset to 0</button>
+      </form>
+      <div style="margin-top:10px"><a href="/cleaner">Back to schedule</a></div>
+    </div>
+    """
+    return HTMLResponse(html_page(body))
+
+@app.post("/counter/reset")
+def counter_reset(password_cookie: str = Cookie(default="")):
+    if not check_auth(password_cookie):
+        return RedirectResponse(url="/login")
+    set_counter(0)
+    return RedirectResponse(url="/counter?msg=Counter%20reset%20to%200", status_code=303)
+
+# =========================
+# Login / Logout pages
+# =========================
+@app.get("/login", response_class=HTMLResponse)
 def login_page():
     return """
     <!doctype html>
@@ -525,39 +548,17 @@ def login_page():
           width:320px;
           text-align:center;
         }
-        h1 {
-          margin:0 0 20px;
-          font-size:22px;
-          color:#111827;
-        }
-        .brand {
-          font-size:26px;
-          font-weight:bold;
-          color:#1976d2;
-          margin-bottom:20px;
-        }
+        h1 { margin:0 0 20px; font-size:22px; color:#111827; }
+        .brand { font-size:26px; font-weight:bold; color:#1976d2; margin-bottom:20px; }
         input {
-          width:100%;
-          padding:12px;
-          margin:10px 0 20px;
-          border:1px solid #ddd;
-          border-radius:8px;
-          font-size:16px;
+          width:100%; padding:12px; margin:10px 0 20px;
+          border:1px solid #ddd; border-radius:8px; font-size:16px;
         }
         button {
-          background:#1976d2;
-          color:#fff;
-          border:none;
-          padding:12px 16px;
-          border-radius:8px;
-          font-weight:bold;
-          font-size:16px;
-          cursor:pointer;
-          width:100%;
+          background:#1976d2; color:#fff; border:none; padding:12px 16px; border-radius:8px;
+          font-weight:bold; font-size:16px; cursor:pointer; width:100%;
         }
-        button:hover {
-          background:#145aa0;
-        }
+        button:hover { background:#145aa0; }
       </style>
     </head>
     <body>
@@ -576,10 +577,11 @@ def login_page():
 @app.post("/login")
 async def login_submit(request: Request):
     form = await request.form()
-    pw = form.get("password", "")
-    if pw == APP_PASSWORD:
+    pw = (form.get("password") or "").strip()
+    if APP_PASSWORD and pw == APP_PASSWORD:
         resp = RedirectResponse(url="/cleaner", status_code=303)
-        resp.set_cookie(SESSION_COOKIE, APP_PASSWORD, httponly=True, max_age=60*60*12)  # 12h session
+        # 12-hour session
+        resp.set_cookie(SESSION_COOKIE, APP_PASSWORD, httponly=True, max_age=60*60*12, samesite="lax")
         return resp
     return RedirectResponse(url="/login", status_code=303)
 
@@ -589,45 +591,9 @@ def logout():
     resp.delete_cookie(SESSION_COOKIE)
     return resp
 
-# ===================================================================
-
-# ---------------------------
-# Counter: simple admin page + APIs
-# ---------------------------
-@app.get("/api/counter")
-def api_counter_value():
-    return {"count": get_counter()}
-
-@app.get("/counter", response_class=HTMLResponse)
-def counter_page(msg: str = ""):
-    body = f"""
-    <div class="card" style="max-width:520px">
-      <h2 style="margin-top:0">Clean Counter</h2>
-      <p style="font-weight:700">Current count: {get_counter()}</p>
-      {"<p style='color:#2e7d32;font-weight:700'>" + msg + "</p>" if msg else ""}
-      <form action="/counter/reset" method="post" style="display:grid;gap:8px;max-width:360px">
-        <label>Password for reset</label>
-        <input type="password" name="password" autocomplete="current-password" style="padding:8px;border:1px solid #ddd;border-radius:8px">
-        <button type="submit" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Reset to 0</button>
-      </form>
-      <div style="margin-top:10px"><a href="/cleaner">Back to schedule</a></div>
-    </div>
-    """
-    return HTMLResponse(html_page(body))
-
-@app.post("/counter/reset")
-def counter_reset(password: str = Form("")):
-    if not COUNTER_PASSWORD:
-        # If you forgot to set a password, block resets for safety
-        return RedirectResponse(url="/counter?msg=Password%20not%20configured", status_code=303)
-    if password != COUNTER_PASSWORD:
-        return RedirectResponse(url="/counter?msg=Invalid%20password", status_code=303)
-    set_counter(0)
-    return RedirectResponse(url="/counter?msg=Counter%20reset%20to%200", status_code=303)
-
-# ---------------------------
+# =========================
 # Local run
-# ---------------------------
+# =========================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
