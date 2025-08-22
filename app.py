@@ -324,11 +324,11 @@ def render_schedule(sched: Dict[date, List[Dict]], days: int) -> str:
 # =========================
 # Auth helpers (custom login page)
 # =========================
-def check_auth(password_cookie: str = Cookie(default="")) -> bool:
+def check_auth(session_token: Optional[str]) -> bool:
     """
     True if a valid session cookie is present.
     """
-    return bool(APP_PASSWORD) and (password_cookie == APP_PASSWORD)
+    return bool(APP_PASSWORD) and (session_token == APP_PASSWORD)
 
 # =========================
 # Routes
@@ -338,15 +338,15 @@ def root():
     return "OK"
 
 @app.get("/cleaner", response_class=HTMLResponse)
-def cleaner(days: int = DEFAULT_DAYS, password_cookie: str = Cookie(default="")):
-    if not check_auth(password_cookie):
+def cleaner(days: int = DEFAULT_DAYS, session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
         return RedirectResponse(url="/login")
     schedule = build_schedule(days)
     return HTMLResponse(html_page(render_schedule(schedule, days)))
 
 @app.get("/debug", response_class=PlainTextResponse)
-def debug(password_cookie: str = Cookie(default="")):
-    if not check_auth(password_cookie):
+def debug(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
         return RedirectResponse(url="/login")
     flats = load_flats()
     lines = ["Loaded flats:"]
@@ -420,8 +420,8 @@ def _upload_form(flat: str, the_date: str, msg: str = "") -> str:
 </body></html>"""
 
 @app.get("/upload", response_class=HTMLResponse)
-def upload_form(flat: str, date: str, password_cookie: str = Cookie(default="")):
-    if not check_auth(password_cookie):
+def upload_form(flat: str, date: str, session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
         return RedirectResponse(url="/login")
     return HTMLResponse(_upload_form(flat, date))
 
@@ -434,9 +434,9 @@ async def upload_submit(
     notes: str = Form(""),
     tasks: List[str] = Form(None),
     photos: List[UploadFile] = File(default_factory=list),
-    password_cookie: str = Cookie(default=""),
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    if not check_auth(password_cookie):
+    if not check_auth(session_token):
         return RedirectResponse(url="/login")
 
     tasks = tasks or []
@@ -490,14 +490,14 @@ async def upload_submit(
 # Counter admin (requires login)
 # =========================
 @app.get("/api/counter")
-def api_counter_value(password_cookie: str = Cookie(default="")):
-    if not check_auth(password_cookie):
+def api_counter_value(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
         return {"count": 0}
     return {"count": get_counter()}
 
 @app.get("/counter", response_class=HTMLResponse)
-def counter_page(msg: str = "", password_cookie: str = Cookie(default="")):
-    if not check_auth(password_cookie):
+def counter_page(msg: str = "", session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
         return RedirectResponse(url="/login")
     body = f"""
     <div class="card" style="max-width:520px">
@@ -513,8 +513,8 @@ def counter_page(msg: str = "", password_cookie: str = Cookie(default="")):
     return HTMLResponse(html_page(body))
 
 @app.post("/counter/reset")
-def counter_reset(password_cookie: str = Cookie(default="")):
-    if not check_auth(password_cookie):
+def counter_reset(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
         return RedirectResponse(url="/login")
     set_counter(0)
     return RedirectResponse(url="/counter?msg=Counter%20reset%20to%200", status_code=303)
