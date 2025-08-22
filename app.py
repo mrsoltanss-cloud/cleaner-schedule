@@ -309,21 +309,21 @@ def bump_counter(delta: int = 1) -> int:
 # WhatsApp helper
 # =========================
 def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None) -> None:
-    """Send WhatsApp message; if media_urls given, send those (one message per media)."""
     if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
+        print("Twilio not configured properly")
         return
     try:
         from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
         to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_TO}"
         if media_urls:
-            # Twilio best practice: send one media per message
-            for idx, m in enumerate(media_urls):
-                body = caption if idx == 0 else ""  # include caption on first
-                twilio_client.messages.create(from_=from_num, to=to_num, body=body, media_url=[m])
+            print(f"Sending WA with media: {media_urls}")
+            twilio_client.messages.create(from_=from_num, to=to_num, body=caption, media_url=media_urls)
         else:
+            print("Sending WA text only")
             twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
     except Exception as e:
         print("Twilio error:", repr(e))
+
 
 # =========================
 # HTML helpers
