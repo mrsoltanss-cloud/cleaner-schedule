@@ -209,13 +209,13 @@ def _db_init() -> bool:
         with conn.cursor() as cur:
             # Completed rows (one per flat/day)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS completed_cleans (
-                    flat TEXT NOT NULL,
-                    day  DATE NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (flat, day)
-                );
-            """)
+    CREATE TABLE IF NOT EXISTS counters (
+        id SERIAL PRIMARY KEY,
+        count INTEGER NOT NULL DEFAULT 0,
+        clean_offset INTEGER NOT NULL DEFAULT 0
+    )
+""")
+
             # Manual offset so + / - can adjust total
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS counter_offset (
