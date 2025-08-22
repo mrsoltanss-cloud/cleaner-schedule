@@ -622,35 +622,43 @@ def api_counter_value(session_token: Optional[str] = Cookie(default=None, alias=
         return {"count": 0}
     return {"count": get_counter()}
 
+from fastapi import Form
+
 @app.get("/counter", response_class=HTMLResponse)
-def counter_page(msg: str = "", session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
-    # Require login to view the counter page
+def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
-    pin_input = ""
-    if COUNTER_PASSWORD:
-        pin_input = """
-        <label style="margin:4px 0 6px;display:block">Reset PIN</label>
-        <input type="password" name="pin" style="padding:8px;border:1px solid #ddd;border-radius:8px;width:180px">
-        """
+
     body = f"""
     <div class="card" style="max-width:520px">
-      <h2 style="margin-top:0">Clean Counter</h2>
+      <h2 style="margin-top:0">🧹 Cleans Completed Counter</h2>
       <p style="font-weight:700">Current count: {get_counter()}</p>
-      {"<p style='color:#2e7d32;font-weight:700'>" + msg + "</p>" if msg else ""}
-      <form action="/counter/reset" method="post" style="display:grid;gap:10px;max-width:360px">
-        {pin_input}
-        <button type="submit" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Reset to 0</button>
+      <form action="/counter/update" method="post" style="display:flex;gap:10px;flex-wrap:wrap">
+        <button type="submit" name="action" value="plus" style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➕ Add 1</button>
+        <button type="submit" name="action" value="minus" style="background:#f59e0b;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➖ Subtract 1</button>
+        <button type="submit" name="action" value="reset" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">🔁 Reset</button>
       </form>
-      <div style="margin-top:10px"><a href="/cleaner">Back to schedule</a></div>
+      <div style="margin-top:10px"><a href="/cleaner">⬅ Back to schedule</a></div>
     </div>
     """
     return HTMLResponse(html_page(body))
 
-@app.post("/counter/reset")
-def counter_reset(
-    pin: str = Form(default=""),
-    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+@app.post("/counter/update")
+def counter_update(action: str = Form(...), session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+
+    if action == "plus":
+        bump_counter(1)
+    elif action == "minus":
+        bump_counter(-1)
+    elif action == "reset":
+        set_counter(0)
+
+    return RedirectResponse(url="/counter", status_code=303)
+
+
+
 ):
     # Require login to reset
     if not check_auth(session_token):
