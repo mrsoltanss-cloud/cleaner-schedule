@@ -1,11 +1,11 @@
 # app.py — Cleaner Schedule (FastAPI)
+import psycopg2
 import os
 import uuid
 import json
 import threading
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple, Optional
-
 import requests
 from icalendar import Calendar
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Cookie
@@ -23,6 +23,10 @@ CLEAN_END = os.getenv("CLEAN_END", "16:00")
 # Site login (single shared password)
 APP_PASSWORD = (os.getenv("APP_PASSWORD") or "").strip()
 SESSION_COOKIE = "cleaner_auth"  # cookie name storing session
+
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+USE_DB = bool(DATABASE_URL)
+
 
 # Twilio (optional)
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
@@ -143,22 +147,92 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
         schedule[day].sort(key=lambda it: (not it["out"], it["flat"].lower()))
     return schedule
 
-# =========================
-# Completed markers (per flat/day) + counter
-# =========================
-def mark_path(flat: str, day_iso: str) -> str:
-    safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    return os.path.join(MARK_DIR, f"{day_iso}__{safe_flat}.done")
+# ---------------------------
+# Database-backed completions and counter
+# ---------------------------
 
-def is_completed(flat: str, day_iso: str) -> bool:
-    return os.path.exists(mark_path(flat, day_iso))
+import psycopg2
+import os
 
-def set_completed(flat: str, day_iso: str) -> None:
+def _db_conn():
+    return psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
+
+def _db_init():
     try:
-        with open(mark_path(flat, day_iso), "w") as f:
-            f.write("ok")
-    except Exception:
-        pass
+        conn = _db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS completions (
+                id TEXT PRIMARY KEY
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS counter (
+                id SERIAL PRIMARY KEY,
+                value INT NOT NULL
+            );
+        """)
+        # Ensure one row exists for counter
+        cur.execute("SELECT COUNT(*) FROM counter;")
+        if cur.fetchone()[0] == 0:
+            cur.execute("INSERT INTO counter (value) VALUES (0);")
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print("DB init failed:", e)
+        return False
+
+USE_DB = _db_init()
+
+def mark_completed(clean_id):
+    if not USE_DB: return
+    conn = _db_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO completions (id) VALUES (%s) ON CONFLICT DO NOTHING;", (clean_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def is_completed(clean_id):
+    if not USE_DB: return False
+    conn = _db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM completions WHERE id=%s;", (clean_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(result)
+
+def get_counter():
+    if not USE_DB: return 0
+    conn = _db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM counter LIMIT 1;")
+    val = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return val
+
+def set_counter(val):
+    if not USE_DB: return
+    conn = _db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE counter SET value=%s WHERE id=1;", (val,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def bump_counter():
+    if not USE_DB: return
+    conn = _db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE counter SET value = value + 1 WHERE id=1;")
+    conn.commit()
+    cur.close()
+    conn.close()
+
 
 # Simple counter store (file + lock)
 COUNTER_FILE = os.getenv("COUNTER_FILE", "/tmp/clean_counter.json")
