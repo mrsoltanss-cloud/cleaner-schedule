@@ -2,7 +2,6 @@
 
 import os
 import uuid
-import json
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -13,9 +12,9 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Coo
 from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-# Try to import psycopg2 (Postgres). If unavailable, we’ll fall back to files.
+# Try Postgres driver (psycopg2). If not available, we fall back to file markers.
 try:
-    import psycopg2  # installed via requirements.txt (psycopg2-binary)
+    import psycopg2
 except Exception:
     psycopg2 = None
 
@@ -27,8 +26,10 @@ DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "14"))
 CLEAN_START = os.getenv("CLEAN_START", "10:00")
 CLEAN_END = os.getenv("CLEAN_END", "16:00")
 
+# Auth
 APP_PASSWORD = (os.getenv("APP_PASSWORD") or "").strip()
 SESSION_COOKIE = "cleaner_auth"
+COUNTER_PASSWORD = (os.getenv("COUNTER_PASSWORD") or "").strip()  # extra PIN for counter actions
 
 # Twilio (optional)
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
@@ -36,15 +37,15 @@ TWILIO_AUTH_TOKEN  = (os.getenv("TWILIO_AUTH_TOKEN")  or "").strip()
 TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()
 TWILIO_WHATSAPP_TO   = (os.getenv("TWILIO_WHATSAPP_TO")   or "").strip()
 
-# Public base URL (for media links and optional redirect)
+# Base URL used for absolute media links and redirect
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
-# Database URL (Render Postgres “External Database URL”)
+# Database URL (Render Postgres External URL)
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
-# Storage
-UPLOAD_DIR = "/tmp/uploads"   # images saved here
-MARK_DIR   = "/tmp/marks"     # file-fallback markers
+# Storage (local)
+UPLOAD_DIR = "/tmp/uploads"   # saved images for WhatsApp media links
+MARK_DIR   = "/tmp/marks"     # file-fallback for completed markers
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(MARK_DIR,   exist_ok=True)
 
@@ -61,7 +62,7 @@ except Exception:
 app = FastAPI(title="Cleaner Schedule")
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
 
-# Optional: redirect .onrender.com to your custom domain
+# Redirect .onrender.com → custom domain
 @app.middleware("http")
 async def force_custom_domain(request, call_next):
     host = request.headers.get("host", "")
@@ -163,7 +164,7 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
     return schedule
 
 # =========================
-# Postgres-backed completion markers + Counter (with file fallback)
+# DB-backed completions + Counter (with manual offset)
 # =========================
 def _pg_conn():
     if not psycopg2 or not DATABASE_URL:
@@ -175,6 +176,7 @@ def _db_init() -> bool:
         conn = _pg_conn()
         conn.autocommit = True
         with conn.cursor() as cur:
+            # completed rows → base count
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS completed_cleans (
                     flat TEXT NOT NULL,
@@ -183,6 +185,14 @@ def _db_init() -> bool:
                     PRIMARY KEY (flat, day)
                 );
             """)
+            # manual offset for +/− buttons
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS counter_offset (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    offset INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+            cur.execute("INSERT INTO counter_offset (id, offset) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;")
         conn.close()
         return True
     except Exception as e:
@@ -190,6 +200,29 @@ def _db_init() -> bool:
         return False
 
 USE_DB = _db_init()
+
+def _db_completed_count() -> int:
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM completed_cleans;")
+        n = int(cur.fetchone()[0])
+    conn.close()
+    return n
+
+def _db_get_offset() -> int:
+    conn = _pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT offset FROM counter_offset WHERE id=1;")
+        off = int(cur.fetchone()[0])
+    conn.close()
+    return off
+
+def _db_set_offset(new_off: int) -> None:
+    conn = _pg_conn()
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("UPDATE counter_offset SET offset=%s WHERE id=1;", (int(new_off),))
+    conn.close()
 
 def mark_path(flat: str, day_iso: str) -> str:
     safe = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -231,12 +264,7 @@ def set_completed(flat: str, day_iso: str) -> None:
 def get_counter() -> int:
     if USE_DB:
         try:
-            conn = _pg_conn()
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM completed_cleans")
-                n = int(cur.fetchone()[0])
-            conn.close()
-            return n
+            return _db_completed_count() + _db_get_offset()
         except Exception as e:
             print("DB get_counter error, fallback:", repr(e))
     try:
@@ -245,49 +273,57 @@ def get_counter() -> int:
         return 0
 
 def set_counter(v: int) -> int:
-    # We support reset-to-zero; counter equals number of rows
+    """Set total to v by adjusting the manual offset (DB)."""
     if USE_DB:
         try:
-            if int(v) <= 0:
-                conn = _pg_conn()
-                conn.autocommit = True
-                with conn.cursor() as cur:
-                    cur.execute("TRUNCATE TABLE completed_cleans;")
-                conn.close()
-                return 0
+            v = int(v)
+            completed = _db_completed_count()
+            _db_set_offset(v - completed)
             return get_counter()
         except Exception as e:
-            print("DB set_counter error, fallback:", repr(e))
-    # file fallback: delete markers
-    try:
-        for n in os.listdir(MARK_DIR):
-            if n.endswith(".done"):
-                try: os.remove(os.path.join(MARK_DIR, n))
-                except Exception: pass
-    except Exception:
-        pass
-    return 0
+            print("DB set_counter error:", repr(e))
+            return get_counter()
+    # file fallback: reset when v <= 0
+    if int(v) <= 0:
+        try:
+            for n in os.listdir(MARK_DIR):
+                if n.endswith(".done"):
+                    os.remove(os.path.join(MARK_DIR, n))
+        except Exception:
+            pass
+        return 0
+    return get_counter()
 
 def bump_counter(delta: int = 1) -> int:
-    # No-op with DB; counter is derived from rows.
-    # For file fallback, we don't increment directly either; kept for API compatibility.
+    """Manual adjust using the offset table (DB)."""
+    if USE_DB:
+        try:
+            _db_set_offset(_db_get_offset() + int(delta))
+            return get_counter()
+        except Exception as e:
+            print("DB bump_counter error:", repr(e))
+            return get_counter()
     return get_counter()
 
 # =========================
 # WhatsApp helper
 # =========================
 def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None) -> None:
+    """Send WhatsApp message; if media_urls given, send those (one message per media)."""
     if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
         return
     try:
         from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
         to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_TO}"
         if media_urls:
-            twilio_client.messages.create(from_=from_num, to=to_num, body=caption, media_url=media_urls)
+            # Twilio best practice: send one media per message
+            for idx, m in enumerate(media_urls):
+                body = caption if idx == 0 else ""  # include caption on first
+                twilio_client.messages.create(from_=from_num, to=to_num, body=body, media_url=[m])
         else:
             twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
-    except Exception:
-        pass
+    except Exception as e:
+        print("Twilio error:", repr(e))
 
 # =========================
 # HTML helpers
@@ -349,7 +385,7 @@ def html_page(body: str) -> str:
 </body></html>"""
 
 # =========================
-# Auth helpers
+# Auth helper
 # =========================
 def check_auth(session_token: Optional[str]) -> bool:
     return bool(APP_PASSWORD) and (session_token == APP_PASSWORD)
@@ -390,7 +426,7 @@ def debug(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOK
     lines.append(f"\nDays with activity in next 14 days: {len(schedule)}")
     return "\n".join(lines)
 
-# Serve uploaded media (public)
+# Serve uploaded media (public so WhatsApp can fetch)
 @app.get("/m/{fname}")
 def serve_media(fname: str):
     path = os.path.join(UPLOAD_DIR, fname)
@@ -448,6 +484,7 @@ async def upload_submit(
     tasks = tasks or []
     tasks_line = ", ".join(tasks) if tasks else "None"
 
+    # Save files and build public URLs
     saved_urls: List[str] = []
     for f in photos or []:
         try:
@@ -461,15 +498,17 @@ async def upload_submit(
                 w.write(await f.read())
             base = PUBLIC_BASE_URL or f"{request.url.scheme}://{request.url.netloc}"
             saved_urls.append(f"{base}/m/{fname}")
-        except Exception:
+        except Exception as e:
+            print("Save file error:", repr(e))
             continue
 
-    # Mark completed and let the DB derive the counter (only first time counts)
+    # Mark completed (only first time counts toward base)
     already_completed = is_completed(flat, date)
     set_completed(flat, date)
     if not already_completed:
-        bump_counter(1)  # no-op for DB, but keeps function API consistent
+        bump_counter(1)  # adjusts offset (DB) or no-op; keeps API consistent
 
+    # Caption for first photo
     caption_lines = [
         "🧹 Cleaning update",
         f"Flat: {flat}",
@@ -481,21 +520,17 @@ async def upload_submit(
         caption_lines.append(f"Notes: {notes.strip()}")
     caption = "\n".join(caption_lines)
 
-    # WhatsApp: one message per photo (first can include caption)
+    # WhatsApp send (first msg includes caption)
     if saved_urls:
-        for idx, url in enumerate(saved_urls):
-            body = caption if idx == 0 else ""
-            wa_send_text_and_media(body, media_urls=[url])
+        wa_send_text_and_media(caption, media_urls=saved_urls)
     else:
         wa_send_text_and_media(caption)
 
     return RedirectResponse(url="/cleaner", status_code=303)
 
 # =========================
-# Counter admin (➕ / ➖ / 🔁) — requires login
+# Counter admin (login + optional PIN)
 # =========================
-from fastapi import Form as _Form  # alias to avoid confusion; already imported above
-
 @app.get("/api/counter")
 def api_counter_value(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
     if not check_auth(session_token):
@@ -507,11 +542,19 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
 
+    pin_field = ""
+    if COUNTER_PASSWORD:
+        pin_field = (
+            '<input type="password" name="pin" placeholder="PIN" '
+            'style="padding:8px;border:1px solid #ddd;border-radius:8px;min-width:100px">'
+        )
+
     body = (
         '<div class="card" style="max-width:520px">'
         '<h2 style="margin-top:0">🧹 Cleans Completed Counter</h2>'
         f'<p style="font-weight:700">Current count: {get_counter()}</p>'
-        '<form action="/counter/update" method="post" style="display:flex;gap:10px;flex-wrap:wrap">'
+        '<form action="/counter/update" method="post" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+        f'{pin_field}'
         '<button type="submit" name="action" value="plus" '
         'style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➕ Add 1</button>'
         '<button type="submit" name="action" value="minus" '
@@ -526,31 +569,21 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
 
 @app.post("/counter/update")
 def counter_update(
-    action: str = _Form(...),
+    action: str = Form(...),
+    pin: str = Form(default=""),
     session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
 ):
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
 
+    # extra PIN (optional)
+    if COUNTER_PASSWORD and pin != COUNTER_PASSWORD:
+        return RedirectResponse(url="/counter", status_code=303)
+
     if action == "plus":
-        bump_counter(1)         # no-op with DB; kept for compatibility
+        bump_counter(1)
     elif action == "minus":
-        # With DB we can't decrement rows; emulate by resetting and re-adding (simple approach):
-        if USE_DB:
-            # naive decrement: TRUNCATE then re-insert N-1 latest; to keep simple, just reset when minus is used
-            # If you prefer strict decrement logic, we can implement a more advanced method later.
-            current = get_counter()
-            if current > 0:
-                set_counter(current - 1)  # for DB this returns current; fallback handles deletion of files
-        else:
-            # file fallback: remove one marker file if any
-            try:
-                for n in os.listdir(MARK_DIR):
-                    if n.endswith(".done"):
-                        os.remove(os.path.join(MARK_DIR, n))
-                        break
-            except Exception:
-                pass
+        bump_counter(-1)
     elif action == "reset":
         set_counter(0)
 
@@ -596,6 +629,7 @@ async def login_submit(request: Request):
     pw = (form.get("password") or "").strip()
     if APP_PASSWORD and pw == APP_PASSWORD:
         resp = RedirectResponse(url="/cleaner", status_code=303)
+        # 12-hour session
         resp.set_cookie(SESSION_COOKIE, APP_PASSWORD, httponly=True, max_age=60*60*12, samesite="lax")
         return resp
     return RedirectResponse(url="/login", status_code=303)
