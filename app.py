@@ -333,6 +333,48 @@ def bump_counter(delta: int = 1) -> int:
         _write_counter_value(c)
         return c
 
+# ----- helpers to delete completed marks -----
+def clear_completed(day_iso: Optional[str] = None, flat: Optional[str] = None):
+    """
+    Delete completion markers from DB or files.
+      - If day_iso only -> clears all flats on that day.
+      - If day_iso + flat -> clears one flat on that day.
+      - If neither -> clears everything (danger!).
+    """
+    if USE_DB:
+        try:
+            conn = _pg_conn()
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                if day_iso and flat:
+                    cur.execute("DELETE FROM completed_cleans WHERE day=%s AND flat=%s", (day_iso, flat))
+                elif day_iso:
+                    cur.execute("DELETE FROM completed_cleans WHERE day=%s", (day_iso,))
+                else:
+                    cur.execute("DELETE FROM completed_cleans")
+            conn.close()
+            return
+        except Exception as e:
+            print("DB clear_completed error, fallback:", repr(e))
+
+    # file fallback
+    try:
+        if day_iso and flat:
+            safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            p = os.path.join(MARK_DIR, f"{day_iso}__{safe_flat}.done")
+            if os.path.exists(p):
+                os.remove(p)
+        elif day_iso:
+            for fname in os.listdir(MARK_DIR):
+                if fname.startswith(f"{day_iso}__") and fname.endswith(".done"):
+                    os.remove(os.path.join(MARK_DIR, fname))
+        else:
+            for fname in os.listdir(MARK_DIR):
+                if fname.endswith(".done"):
+                    os.remove(os.path.join(MARK_DIR, fname))
+    except Exception as e:
+        print("File clear_completed error:", repr(e))
+
 # ---------------------------
 # WhatsApp helper
 # ---------------------------
@@ -684,29 +726,94 @@ def api_counter_value(session_token: Optional[str] = Cookie(default=None, alias=
 def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
+
+    # one reusable PIN input
     pin_field = ""
     if COUNTER_PASSWORD:
         pin_field = (
             '<input type="password" name="pin" placeholder="PIN" '
-            'style="padding:8px;border:1px solid #ddd;border-radius:8px;min-width:100px">'
+            'style="padding:8px;border:1px solid #ddd;border-radius:8px;min-width:120px" required>'
         )
+
     body = (
-        '<div class="card" style="max-width:520px">'
+        '<div class="card" style="max-width:640px">'
         '<h2 style="margin-top:0">🧹 Cleans Completed Counter</h2>'
         f'<p style="font-weight:700">Current count: {get_counter()}</p>'
-        '<form action="/counter/update" method="post" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+
+        # counter controls
+        '<form action="/counter/update" method="post" '
+        'style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'
         f'{pin_field}'
         '<button type="submit" name="action" value="plus" '
         'style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➕ Add 1</button>'
         '<button type="submit" name="action" value="minus" '
         'style="background:#f59e0b;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">➖ Subtract 1</button>'
         '<button type="submit" name="action" value="reset" '
-        'style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">🔁 Reset</button>'
+        'style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">🔁 Reset total</button>'
         '</form>'
-        '<div style="margin-top:10px"><a href="/cleaner">⬅ Back to schedule</a></div>'
+
+        '<hr style="margin:14px 0;border:0;border-top:1px solid #eee">'
+
+        # reset completed marks
+        '<h3 style="margin:0 0 8px">Reset completed marks</h3>'
+        '<p class="legend" style="margin:6px 0 10px">'
+        'Choose a scope. For <b>Clear ALL</b>, you must type <code>CONFIRM</code>.'
+        '</p>'
+
+        '<form action="/completed/reset" method="post" '
+        'style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        f'{pin_field}'
+        '<input type="date" name="day" placeholder="YYYY-MM-DD" '
+        'style="padding:8px;border:1px solid #ddd;border-radius:8px">'
+        '<input type="text" name="flat" placeholder="Optional: Flat name (exact)" '
+        'style="padding:8px;border:1px solid #ddd;border-radius:8px">'
+        '<input type="text" name="confirm" placeholder="Type CONFIRM for Clear ALL" '
+        'style="padding:8px;border:1px solid #ddd;border-radius:8px;flex:1;min-width:220px">'
+        '<button type="submit" name="scope" value="day" '
+        'style="background:#0ea5e9;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Clear day</button>'
+        '<button type="submit" name="scope" value="flat_day" '
+        'style="background:#6366f1;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Clear flat+day</button>'
+        '<button type="submit" name="scope" value="all" '
+        'style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">Clear ALL</button>'
+        '</form>'
+
+        '<div style="margin-top:14px"><a href="/cleaner">⬅ Back to schedule</a></div>'
         '</div>'
     )
-    return HTMLResponse(html_page(body))
+    return HTMLResponse(html_page(body)))
+
+@app.post("/completed/reset")
+def completed_reset(
+    scope: str = Form(...),                 # "day" | "flat_day" | "all"
+    day: str = Form(default=""),            # YYYY-MM-DD
+    flat: str = Form(default=""),
+    confirm: str = Form(default=""),        # must equal "CONFIRM" for scope=all
+    pin: str = Form(default=""),
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    # must be logged in
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+
+    # must pass Admin PIN (same requirement as the bumper)
+    if COUNTER_PASSWORD and pin != COUNTER_PASSWORD:
+        return RedirectResponse(url="/counter", status_code=303)
+
+    # enforce confirmation for the dangerous action
+    if scope == "all":
+        if confirm.strip().upper() != "CONFIRM":
+            return RedirectResponse(url="/counter", status_code=303)
+
+    # do the reset
+    if scope == "flat_day" and day and flat:
+        clear_completed(day_iso=day, flat=flat)
+    elif scope == "day" and day:
+        clear_completed(day_iso=day)
+    elif scope == "all":
+        clear_completed()
+
+    # No need to recalc the counter here; it's derived from DB rows + clean_offset.
+    return RedirectResponse(url="/counter", status_code=303)
 
 @app.post("/counter/update")
 def counter_update(
