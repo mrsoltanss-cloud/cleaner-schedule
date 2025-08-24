@@ -49,7 +49,7 @@ TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
 TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
 TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()
 TWILIO_WHATSAPP_TO = (os.getenv("TWILIO_WHATSAPP_TO") or "").strip()
-TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # not used
+TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # your approved template SID
 
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
@@ -376,9 +376,10 @@ def clear_completed(day_iso: Optional[str] = None, flat: Optional[str] = None):
         print("File clear_completed error:", repr(e))
 
 # ---------------------------
-# WhatsApp helper
+# WhatsApp helpers
 # ---------------------------
 def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None) -> None:
+    """Legacy free-form sender (kept for optional future use)."""
     if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
         print("Twilio not configured")
         return
@@ -396,6 +397,27 @@ def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None)
             twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
     except Exception as e:
         print("Twilio error:", repr(e))
+
+def wa_send_with_template(details_text: str) -> None:
+    """Send using approved WhatsApp template (fills {{1}} with details_text)."""
+    if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO or not TWILIO_CONTENT_SID:
+        print("Template send skipped: missing Twilio config")
+        return
+    try:
+        from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
+        to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:")   else f"whatsapp:{TWILIO_WHATSAPP_TO}"
+
+        vars_json = json.dumps({"1": details_text})
+
+        msg = twilio_client.messages.create(
+            from_=from_num,
+            to=to_num,
+            content_sid=TWILIO_CONTENT_SID,
+            content_variables=vars_json,
+        )
+        print(f"✅ Template sent (sid={msg.sid})")
+    except Exception as e:
+        print("Template send error:", repr(e))
 
 # ---------------------------
 # HTML
@@ -690,26 +712,16 @@ async def upload_submit(
             print("Save file error:", repr(e))
             continue
 
-    # ✅ FIX: just mark completed (no bump_counter)
+    # Mark completion (counter persists via DB offset; no bump here)
     set_completed(flat, date)
 
-    # Build caption (used for first photo)
-    caption_lines = [
-        "🧹 Cleaning update",
-        f"Flat: {flat}",
-        f"Date: {date}",
-        f"Tasks: {tasks_line}",
-        f"Photos: {len(saved_urls)}",
-    ]
+    # Build details for template {{1}}
+    details_text = f"{flat} — {date} — {len(saved_urls)} photos — Tasks: {tasks_line}"
     if notes.strip():
-        caption_lines.append(f"Notes: {notes.strip()}")
-    caption = "\n".join(caption_lines)
+        details_text += f" — Notes: {notes.strip()}"
 
-    # Send to WhatsApp
-    if saved_urls:
-        wa_send_text_and_media(caption, media_urls=saved_urls)
-    else:
-        wa_send_text_and_media(caption)
+    # Send via WhatsApp template (avoids 24h window issues)
+    wa_send_with_template(details_text)
 
     return RedirectResponse(url="/cleaner", status_code=303)
 
