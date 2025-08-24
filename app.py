@@ -47,9 +47,9 @@ COUNTER_PASSWORD = (os.getenv("COUNTER_PASSWORD") or "").strip()
 # Twilio (optional)
 TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
 TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
-TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()
-TWILIO_WHATSAPP_TO = (os.getenv("TWILIO_WHATSAPP_TO") or "").strip()
-TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()  # your approved template SID
+TWILIO_WHATSAPP_FROM = (os.getenv("TWILIO_WHATSAPP_FROM") or "").strip()     # e.g. whatsapp:+1415xxxxxxx or +1415...
+TWILIO_WHATSAPP_TO = (os.getenv("TWILIO_WHATSAPP_TO") or "").strip()         # your personal number to receive updates
+TWILIO_CONTENT_SID = (os.getenv("TWILIO_CONTENT_SID") or "").strip()         # approved template SID
 
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
@@ -200,7 +200,6 @@ def build_schedule(days: int, start: Optional[date] = None) -> Dict[date, List[D
 def _pg_conn():
     if not psycopg2 or not DATABASE_URL:
         raise RuntimeError("DB not available")
-    # Render Postgres supports SSL; no explicit sslmode needed here
     return psycopg2.connect(DATABASE_URL)
 
 def _db_init() -> bool:
@@ -208,7 +207,6 @@ def _db_init() -> bool:
         conn = _pg_conn()
         conn.autocommit = True
         with conn.cursor() as cur:
-            # Completed rows (one per flat/day)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS completed_cleans (
                     flat TEXT NOT NULL,
@@ -217,7 +215,6 @@ def _db_init() -> bool:
                     PRIMARY KEY (flat, day)
                 );
             """)
-            # Manual offset so + / - can adjust total (avoid reserved word 'offset')
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS counter_offset (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -300,12 +297,10 @@ def get_counter() -> int:
             return _db_completed_count() + _db_get_offset()
         except Exception as e:
             print("DB get_counter error, fallback:", repr(e))
-    # file fallback
     with COUNTER_LOCK:
         return _read_counter_value()
 
 def set_counter(v: int) -> int:
-    """Set total to v; with DB we adjust offset so: total = completed + offset."""
     if USE_DB:
         try:
             completed = _db_completed_count()
@@ -319,7 +314,6 @@ def set_counter(v: int) -> int:
         return v
 
 def bump_counter(delta: int = 1) -> int:
-    """Manual adjust using the offset (DB) or file value (fallback)."""
     if USE_DB:
         try:
             _db_set_offset(_db_get_offset() + int(delta))
@@ -357,7 +351,6 @@ def clear_completed(day_iso: Optional[str] = None, flat: Optional[str] = None):
         except Exception as e:
             print("DB clear_completed error, fallback:", repr(e))
 
-    # file fallback
     try:
         if day_iso and flat:
             safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -376,39 +369,77 @@ def clear_completed(day_iso: Optional[str] = None, flat: Optional[str] = None):
         print("File clear_completed error:", repr(e))
 
 # ---------------------------
-# WhatsApp helpers
+# WhatsApp helpers (freeform + template + queue)
 # ---------------------------
-def wa_send_text_and_media(caption: str, media_urls: Optional[List[str]] = None) -> None:
-    """Legacy free-form sender (kept for optional future use)."""
-    if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
-        print("Twilio not configured")
+PHOTO_QUEUE_FILE = "/tmp/photo_queue.json"
+QUEUE_LOCK = threading.Lock()
+
+def _wa_numbers():
+    from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
+    to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:")   else f"whatsapp:{TWILIO_WHATSAPP_TO}"
+    return from_num, to_num
+
+def _load_queue() -> List[dict]:
+    with QUEUE_LOCK:
+        if not os.path.exists(PHOTO_QUEUE_FILE):
+            return []
+        try:
+            with open(PHOTO_QUEUE_FILE, "r") as f:
+                return json.load(f) or []
+        except Exception:
+            return []
+
+def _save_queue(queue: List[dict]) -> None:
+    with QUEUE_LOCK:
+        with open(PHOTO_QUEUE_FILE, "w") as f:
+            json.dump(queue, f)
+
+def _queue_item(caption: str, media_urls: List[str]) -> None:
+    item = {
+        "caption": caption,
+        "media_urls": media_urls or [],
+        "ts": datetime.utcnow().isoformat()
+    }
+    q = _load_queue()
+    q.append(item)
+    _save_queue(q)
+    print(f"Queued {len(media_urls)} photos for later send.")
+
+def _release_queue_and_send():
+    """Send all queued items now (called when inbound WA message arrives)."""
+    if not twilio_client:
+        print("Twilio not configured; cannot release queue.")
         return
-    try:
-        from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
-        to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_TO}"
-        if media_urls:
-            # send one media per message; first carries caption
-            for idx, m in enumerate(media_urls):
-                body = caption if idx == 0 else ""
-                print(f"Sending WA media: {m}")
-                twilio_client.messages.create(from_=from_num, to=to_num, body=body, media_url=[m])
-        else:
-            print("Sending WA text only")
-            twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
-    except Exception as e:
-        print("Twilio error:", repr(e))
+    from_num, to_num = _wa_numbers()
+    q = _load_queue()
+    if not q:
+        print("Queue empty; nothing to send.")
+        return
+    # clear first to avoid loops if send fails halfway
+    _save_queue([])
+    for item in q:
+        caption = item.get("caption", "")
+        media_urls = item.get("media_urls", [])
+        try:
+            if media_urls:
+                for idx, m in enumerate(media_urls):
+                    body = caption if idx == 0 else ""
+                    print(f"[Queue release] Sending media: {m}")
+                    twilio_client.messages.create(from_=from_num, to=to_num, body=body, media_url=[m])
+            else:
+                print("[Queue release] Sending text only.")
+                twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
+        except Exception as e:
+            print("Queue release send error:", repr(e))
 
 def wa_send_with_template(details_text: str) -> None:
     """Send using approved WhatsApp template (fills {{1}} with details_text)."""
-    if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO or not TWILIO_CONTENT_SID:
-        print("Template send skipped: missing Twilio config")
+    if not twilio_client or not TWILIO_CONTENT_SID:
+        print("Template send skipped: missing Twilio client or TWILIO_CONTENT_SID")
         return
     try:
-        from_num = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
-        to_num   = TWILIO_WHATSAPP_TO   if TWILIO_WHATSAPP_TO.startswith("whatsapp:")   else f"whatsapp:{TWILIO_WHATSAPP_TO}"
-
+        from_num, to_num = _wa_numbers()
         vars_json = json.dumps({"1": details_text})
-
         msg = twilio_client.messages.create(
             from_=from_num,
             to=to_num,
@@ -418,6 +449,42 @@ def wa_send_with_template(details_text: str) -> None:
         print(f"✅ Template sent (sid={msg.sid})")
     except Exception as e:
         print("Template send error:", repr(e))
+
+def wa_send_text_and_media_or_queue(caption: str, media_urls: Optional[List[str]], details_text_for_template: str):
+    """
+    Try freeform with media first. If blocked (63016), queue photos and
+    send a template asking the user to reply to open the 24h window.
+    """
+    if not twilio_client or not TWILIO_WHATSAPP_FROM or not TWILIO_WHATSAPP_TO:
+        print("Twilio not configured; skipping WA send.")
+        return
+
+    from_num, to_num = _wa_numbers()
+
+    try:
+        if media_urls:
+            # send one media per message; first carries caption
+            for idx, m in enumerate(media_urls):
+                body = caption if idx == 0 else ""
+                print(f"Sending WA media: {m}")
+                twilio_client.messages.create(from_=from_num, to=to_num, body=body, media_url=[m])
+        else:
+            print("Sending WA text only")
+            twilio_client.messages.create(from_=from_num, to=to_num, body=caption)
+
+    except Exception as e:
+        err = repr(e)
+        print("Twilio freeform error:", err)
+        if "63016" in err or "outside the allowed window" in err.lower():
+            # Queue photos for later delivery
+            _queue_item(caption=caption, media_urls=media_urls or [])
+            # Include a link to the first photo (if any) in the template text for convenience
+            first_link = (media_urls[0] if media_urls else "")
+            appended = f" — View: {first_link}" if first_link else ""
+            wa_send_with_template(details_text_for_template + appended)
+        else:
+            # Unexpected error; just log it
+            print("Unexpected Twilio error (not 63016):", err)
 
 # ---------------------------
 # HTML
@@ -546,7 +613,6 @@ def login_page():
         .brand {font-size:26px; font-weight:bold; color:#1976d2; margin-bottom:20px;}
         input {width:100%; padding:12px; margin:10px 0 20px; border:1px solid #ddd; border-radius:8px; font-size:16px;}
         button {background:#1976d2; color:#fff; border:none; padding:12px 16px; border-radius:8px; font-weight:bold; font-size:16px; cursor:pointer; width:100%;}
-        button:hover {background:#145aa0;}
       </style>
     </head>
     <body>
@@ -693,7 +759,6 @@ async def upload_submit(
                     rgb.save(dest, format="JPEG", quality=90)
                     print(f"Converted HEIC -> JPG: {orig_name} -> {fname}")
                 except Exception as e:
-                    # Fallback: save as given (may not render in WA)
                     fname = f"{uuid.uuid4().hex}{ext}"
                     dest = os.path.join(UPLOAD_DIR, fname)
                     with open(dest, "wb") as w:
@@ -715,13 +780,25 @@ async def upload_submit(
     # Mark completion (counter persists via DB offset; no bump here)
     set_completed(flat, date)
 
-    # Build details for template {{1}}
+    # Build caption for freeform
+    caption_lines = [
+        "🧹 Cleaning update",
+        f"Flat: {flat}",
+        f"Date: {date}",
+        f"Tasks: {tasks_line}",
+        f"Photos: {len(saved_urls)}",
+    ]
+    if notes.strip():
+        caption_lines.append(f"Notes: {notes.strip()}")
+    caption = "\n".join(caption_lines)
+
+    # Build details for template {{1}} (we add first photo link on fallback)
     details_text = f"{flat} — {date} — {len(saved_urls)} photos — Tasks: {tasks_line}"
     if notes.strip():
         details_text += f" — Notes: {notes.strip()}"
 
-    # Send via WhatsApp template (avoids 24h window issues)
-    wa_send_with_template(details_text)
+    # Try freeform media; if outside 24h, queue & send template asking to reply
+    wa_send_text_and_media_or_queue(caption, saved_urls if saved_urls else None, details_text)
 
     return RedirectResponse(url="/cleaner", status_code=303)
 
@@ -803,20 +880,16 @@ def completed_reset(
     pin: str = Form(default=""),
     session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    # must be logged in
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
 
-    # must pass Admin PIN (same requirement as the bumper)
     if COUNTER_PASSWORD and pin != COUNTER_PASSWORD:
         return RedirectResponse(url="/counter", status_code=303)
 
-    # enforce confirmation for the dangerous action
     if scope == "all":
         if confirm.strip().upper() != "CONFIRM":
             return RedirectResponse(url="/counter", status_code=303)
 
-    # do the reset
     if scope == "flat_day" and day and flat:
         clear_completed(day_iso=day, flat=flat)
     elif scope == "day" and day:
@@ -824,7 +897,6 @@ def completed_reset(
     elif scope == "all":
         clear_completed()
 
-    # No need to recalc the counter here; it's derived from DB rows + clean_offset.
     return RedirectResponse(url="/counter", status_code=303)
 
 @app.post("/counter/update")
@@ -847,6 +919,28 @@ def counter_update(
         set_counter(0)
 
     return RedirectResponse(url="/counter", status_code=303)
+
+# ---------------------------
+# Twilio WhatsApp inbound webhook
+# ---------------------------
+@app.post("/wa/incoming")
+async def wa_incoming(request: Request):
+    """
+    Twilio will POST here on inbound WhatsApp messages.
+    We simply treat ANY inbound message as consent to open the 24h window,
+    then immediately release queued media.
+    """
+    try:
+        form = await request.form()
+        from_num = (form.get("From") or "")
+        body = (form.get("Body") or "").strip()
+        print(f"Incoming WA from {from_num}: {body!r}")
+    except Exception as e:
+        print("Inbound parse error:", repr(e))
+
+    # Release queued messages now that user has replied (reopens 24h window)
+    _release_queue_and_send()
+    return PlainTextResponse("OK")
 
 # ---------------------------
 # Local run
