@@ -406,7 +406,7 @@ def _queue_item(caption: str, media_urls: List[str]) -> None:
     print(f"Queued {len(media_urls)} photos for later send.")
 
 def _release_queue_and_send():
-    """Send all queued items now (called when inbound WA message arrives)."""
+    """Send all queued items now (called when inbound WA message arrives or from /queue Release)."""
     if not twilio_client:
         print("Twilio not configured; cannot release queue.")
         return
@@ -486,6 +486,12 @@ def wa_send_text_and_media_or_queue(caption: str, media_urls: Optional[List[str]
             # Unexpected error; just log it
             print("Unexpected Twilio error (not 63016):", err)
 
+def get_queue_count() -> int:
+    try:
+        return len(_load_queue())
+    except Exception:
+        return 0
+
 # ---------------------------
 # HTML
 # ---------------------------
@@ -498,8 +504,9 @@ BASE_CSS = f"""
   body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial; margin:24px; background:var(--bg); color:#111; }}
   h1 {{ margin:0 0 8px }}
   .legend {{ color:var(--muted); margin-bottom:12px }}
-  .counter-badge {{ display:inline-flex; align-items:center; gap:8px; background:#fff; border:1px solid #eee; border-radius:12px; padding:6px 10px; font-weight:700; margin-bottom:16px }}
-  .counter-badge a {{ margin-left:8px; font-weight:600; font-size:13px }}
+  .badges {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px }}
+  .counter-badge, .queue-badge {{ display:inline-flex; align-items:center; gap:8px; background:#fff; border:1px solid #eee; border-radius:12px; padding:6px 10px; font-weight:700; }}
+  .counter-badge a, .queue-badge a {{ margin-left:8px; font-weight:600; font-size:13px }}
   .day {{ background:var(--card); border:1px solid #eee; border-radius:14px; padding:16px; margin:16px 0; box-shadow:0 2px 6px rgba(0,0,0,.04); }}
   .day h2 {{ margin:0 0 10px; display:flex; align-items:center; gap:10px }}
   .today {{ background:#111; color:#fff; font-size:12px; padding:3px 8px; border-radius:999px }}
@@ -517,6 +524,7 @@ BASE_CSS = f"""
   .tasks {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:6px 14px; margin:10px 0 6px; }}
   .tasks label {{ display:flex; align-items:center; gap:8px; font-size:14px; }}
   .card{{ background:#fff; border-radius:14px; padding:16px; box-shadow:0 1px 2px rgba(0,0,0,.05); border:1px solid #eee; }}
+  .mono {{ font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }}
 </style>
 """
 
@@ -534,14 +542,17 @@ TASK_LABELS = [
 ]
 
 def html_page(body: str) -> str:
+    queue_ct = get_queue_count()
     counter_html = f'<div class="counter-badge">✅ Cleans completed: <span>{get_counter()}</span> <a href="/counter">Admin</a></div>'
+    queue_html = f'<div class="queue-badge">📦 Queued WA: <span>{queue_ct}</span> <a href="/queue">Manage</a></div>' if queue_ct > 0 else ''
+    badges = f'<div class="badges">{counter_html}{queue_html}</div>'
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cleaner Schedule</title>{BASE_CSS}</head>
 <body>
   <h1>Cleaner Schedule</h1>
   <div class="legend">Check-out in <span style="color:#d32f2f;font-weight:800">red</span> • Check-in in <span style="color:#2e7d32;font-weight:800">green</span> • <b>SAME-DAY</b> stands out • Clean {CLEAN_START}–{CLEAN_END}</div>
-  {counter_html}
+  {badges}
   {body}
 </body></html>"""
 
@@ -759,6 +770,7 @@ async def upload_submit(
                     rgb.save(dest, format="JPEG", quality=90)
                     print(f"Converted HEIC -> JPG: {orig_name} -> {fname}")
                 except Exception as e:
+                    # Fallback: save as given (may not render in WA)
                     fname = f"{uuid.uuid4().hex}{ext}"
                     dest = os.path.join(UPLOAD_DIR, fname)
                     with open(dest, "wb") as w:
@@ -816,6 +828,9 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
     if not check_auth(session_token):
         return RedirectResponse(url="/login")
 
+    queue_ct = get_queue_count()
+    queue_note = f'<p class="mono">📦 Queued WhatsApp sends: <b>{queue_ct}</b> — <a href="/queue">Manage queue</a></p>' if queue_ct > 0 else ""
+
     # one reusable PIN input
     pin_field = ""
     if COUNTER_PASSWORD:
@@ -828,6 +843,7 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
         '<div class="card" style="max-width:640px">'
         '<h2 style="margin-top:0">🧹 Cleans Completed Counter</h2>'
         f'<p style="font-weight:700">Current count: {get_counter()}</p>'
+        f'{queue_note}'
 
         # counter controls
         '<form action="/counter/update" method="post" '
@@ -921,13 +937,79 @@ def counter_update(
     return RedirectResponse(url="/counter", status_code=303)
 
 # ---------------------------
-# Twilio WhatsApp inbound webhook
+# Queue management UI (PIN-gated)
+# ---------------------------
+@app.get("/queue", response_class=HTMLResponse)
+def queue_page(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+
+    q = _load_queue()
+    items_html = []
+    if q:
+        for i, item in enumerate(q, start=1):
+            ts = item.get("ts", "")
+            cap = item.get("caption", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            media = item.get("media_urls", [])
+            first = media[0] if media else ""
+            items_html.append(
+                f'<div class="card"><div style="font-weight:700">#{i} — {ts}</div>'
+                f'<div class="mono" style="white-space:pre-wrap;margin:6px 0">{cap}</div>'
+                f'<div>Photos: <b>{len(media)}</b> {"• <a href=\'"+first+"\' target=\'_blank\'>first link</a>" if first else ""}</div></div>'
+            )
+    else:
+        items_html.append('<p>No queued items.</p>')
+
+    pin_field = ""
+    if COUNTER_PASSWORD:
+        pin_field = (
+            '<input type="password" name="pin" placeholder="PIN" '
+            'style="padding:8px;border:1px solid #ddd;border-radius:8px;min-width:120px" required>'
+        )
+
+    body = (
+        '<div class="card" style="max-width:760px">'
+        f'<h2 style="margin-top:0">📦 WhatsApp Queue ({len(q)})</h2>'
+        + "".join(items_html) +
+        '<form action="/queue/release" method="post" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        f'{pin_field}'
+        '<button type="submit" style="background:#16a34a;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">▶️ Release now</button>'
+        '</form>'
+        '<form action="/queue/clear" method="post" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        f'{pin_field}'
+        '<button type="submit" style="background:#ef4444;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700">🗑 Clear queue</button>'
+        '</form>'
+        '<div style="margin-top:14px"><a href="/counter">⬅ Back to counter</a></div>'
+        '</div>'
+    )
+    return HTMLResponse(html_page(body))
+
+@app.post("/queue/release")
+def queue_release(pin: str = Form(default=""), session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+    if COUNTER_PASSWORD and pin != COUNTER_PASSWORD:
+        return RedirectResponse(url="/queue", status_code=303)
+    _release_queue_and_send()
+    return RedirectResponse(url="/queue", status_code=303)
+
+@app.post("/queue/clear")
+def queue_clear(pin: str = Form(default=""), session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    if not check_auth(session_token):
+        return RedirectResponse(url="/login")
+    if COUNTER_PASSWORD and pin != COUNTER_PASSWORD:
+        return RedirectResponse(url="/queue", status_code=303)
+    _save_queue([])
+    return RedirectResponse(url="/queue", status_code=303)
+
+# ---------------------------
+# Twilio WhatsApp inbound webhook (auto-release queue)
 # ---------------------------
 @app.post("/wa/incoming")
 async def wa_incoming(request: Request):
     """
     Twilio will POST here on inbound WhatsApp messages.
-    We simply treat ANY inbound message as consent to open the 24h window,
+    We treat ANY inbound message as consent to open the 24h window,
     then immediately release queued media.
     """
     try:
@@ -938,7 +1020,6 @@ async def wa_incoming(request: Request):
     except Exception as e:
         print("Inbound parse error:", repr(e))
 
-    # Release queued messages now that user has replied (reopens 24h window)
     _release_queue_and_send()
     return PlainTextResponse("OK")
 
