@@ -642,26 +642,23 @@ async def upload_submit(
                 with open(dest, "wb") as w:
                     w.write(raw_bytes)
 
-            base = PUBLIC_BASE_URL or f"{request.url.scheme}://{request.url.netloc}"
-            saved_urls.append(f"{base}/m/{fname}")
-        except Exception as e:
-            print("Save file error:", repr(e))
-            continue
+           base = PUBLIC_BASE_URL or f"{request.url.scheme}://{request.url.netloc}"
+        saved_urls.append(f"{base}/m/{fname}")
+    except Exception as e:
+        print("Save file error:", repr(e))
+        continue
 
-    # Mark completion and bump count only once per flat/day
-    already_completed = is_completed(flat, date)
-    set_completed(flat, date)
-    if not already_completed:
-        bump_counter(1)
+# ✅ FIX: just mark completed (no bump_counter)
+set_completed(flat, date)
 
-    # Build caption (used for first photo)
-    caption_lines = [
-        "🧹 Cleaning update",
-        f"Flat: {flat}",
-        f"Date: {date}",
-        f"Tasks: {tasks_line}",
-        f"Photos: {len(saved_urls)}",
-    ]
+# Build caption (used for first photo)
+caption_lines = [
+    "🧹 Cleaning update",
+    f"Flat: {flat}",
+    f"Date: {date}",
+    f"Tasks: {tasks_line}",
+    f"Photos: {len(saved_urls)}",
+]
     if notes.strip():
         caption_lines.append(f"Notes: {notes.strip()}")
     caption = "\n".join(caption_lines)
