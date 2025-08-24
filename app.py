@@ -780,7 +780,7 @@ def counter_page(session_token: Optional[str] = Cookie(default=None, alias=SESSI
         '<div style="margin-top:14px"><a href="/cleaner">⬅ Back to schedule</a></div>'
         '</div>'
     )
-    return HTMLResponse(html_page(body)))
+    return HTMLResponse(html_page(body))
 
 @app.post("/completed/reset")
 def completed_reset(
