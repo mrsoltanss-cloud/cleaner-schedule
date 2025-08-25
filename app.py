@@ -351,6 +351,7 @@ def clear_completed(day_iso: Optional[str] = None, flat: Optional[str] = None):
         except Exception as e:
             print("DB clear_completed error, fallback:", repr(e))
 
+    # file fallback
     try:
         if day_iso and flat:
             safe_flat = flat.replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -544,7 +545,8 @@ TASK_LABELS = [
 def html_page(body: str) -> str:
     queue_ct = get_queue_count()
     counter_html = f'<div class="counter-badge">✅ Cleans completed: <span>{get_counter()}</span> <a href="/counter">Admin</a></div>'
-    queue_html = f'<div class="queue-badge">📦 Queued WA: <span>{queue_ct}</span> <a href="/queue">Manage</a></div>' if queue_ct > 0 else ''
+    # Always show the queue badge, even when 0
+    queue_html = f'<div class="queue-badge">📦 Queued WA: <span>{queue_ct}</span> <a href="/queue">Manage</a></div>'
     badges = f'<div class="badges">{counter_html}{queue_html}</div>'
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -955,7 +957,7 @@ def queue_page(session_token: Optional[str] = Cookie(default=None, alias=SESSION
             items_html.append(
                 f'<div class="card"><div style="font-weight:700">#{i} — {ts}</div>'
                 f'<div class="mono" style="white-space:pre-wrap;margin:6px 0">{cap}</div>'
-                f'<div>Photos: <b>{len(media)}</b> {"• <a href=\'"+first+"\' target=\'_blank\'>first link</a>" if first else ""}</div></div>'
+                f'<div>Photos: <b>{len(media)}</b> {"• <a href=\''+first+'\' target=\'_blank\'>first link</a>" if first else ""}</div></div>'
             )
     else:
         items_html.append('<p>No queued items.</p>')
